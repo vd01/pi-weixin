@@ -1,0 +1,16 @@
+{
+  "name": "pi-weixin-agent",
+  "version": "1.0.0",
+  "description": "pi coding agent 微信扩展：扫码绑定微信，查看执行结果（仅最终结果）并回复消息下发命令",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.6.0"
+  }
+}
