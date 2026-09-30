@@ -106,6 +106,8 @@ interface Settings {
   silent?: boolean;
   /** 是否在输入框上方显示微信状态 widget */
   widget?: boolean;
+  /** 后台日志是否输出到终端（默认关闭，日志文件始终写入） */
+  debug?: boolean;
 }
 
 function readSettings(): Settings {
@@ -132,6 +134,35 @@ function saveSilent(silent: boolean): void {
 
 function loadWidgetEnabled(): boolean {
   return readSettings().widget !== false; // 默认开启
+}
+
+// --- 后台日志：默认只落盘，不写终端 ---
+//
+// 扩展里的 console.log / console.error 在交互式 TUI 中会直接打到终端上，
+// 表现为输入框附近突然冒出来的几行字，非常干扰输入。
+// 因此后台路径（推送失败、长轮询错误等）一律只写日志文件，
+// 需要现场排查时用 /wx debug on（或环境变量 WEIXIN_DEBUG=1）打开终端输出。
+
+const LOG_FILE = path.join(STATE_DIR, "weixin.log");
+const LOG_MAX_BYTES = 256 * 1024;
+
+function loadDebugEnabled(): boolean {
+  if (process.env.WEIXIN_DEBUG === "1") return true;
+  return Boolean(readSettings().debug);
+}
+
+function wxLog(message: string): void {
+  const line = `${new Date().toISOString()} [weixin] ${message}`;
+  try {
+    ensureStateDir();
+    if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) {
+      fs.writeFileSync(LOG_FILE, "");
+    }
+    fs.appendFileSync(LOG_FILE, `${line}\n`);
+  } catch {
+    // 落盘失败不影响主流程
+  }
+  if (loadDebugEnabled()) console.error(line);
 }
 
 // --- 连接所有权锁：同一时间只允许一个 pi 实例连接微信 ---
@@ -209,6 +240,30 @@ let rt: Runtime | null = null;
 
 const WIDGET_ID = "weixin";
 
+/**
+ * 结果推送健康度：只用于日志与 /wx status，不在 TUI/输入框附近主动弹提示。
+ * （静默失败会让用户以为任务没跑完，所以保留按需查询入口）
+ */
+const pushStats = {
+  failures: 0,
+  lastError: "",
+  lastFailAt: 0,
+  lastSuccessAt: 0,
+};
+
+/** 微信侧故障回报的最小间隔，避免反复刷屏 */
+const PUSH_FAILURE_NOTICE_INTERVAL_MS = 5 * 60_000;
+let lastPushFailureNoticeAt = 0;
+
+/**
+ * 已成功推送过的 assistant 消息条目 id。
+ *
+ * 每次 agent 落定（agent_settled）都会推送「最后一条带文本的 assistant 消息」，
+ * 但自动续跑（goal 继续、重试、仅含工具调用的续轮）不会产生新文本，
+ * 于是同一条回复会被反复推送 —— 用条目 id 去重，确保一条回复只发一次。
+ */
+let lastPushedEntryId: string | null = null;
+
 // ---------------------------------------------------------------------------
 // 发送到微信（最终结果推送）
 // ---------------------------------------------------------------------------
@@ -246,11 +301,28 @@ async function pushToWechat(text: string, opts: { prefix?: string } = {}): Promi
         contextToken,
       });
     }
+    pushStats.failures = 0;
+    pushStats.lastSuccessAt = Date.now();
     return true;
   } catch (err) {
-    console.error(`[weixin] 推送失败: ${err instanceof Error ? err.message : String(err)}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    pushStats.failures += 1;
+    pushStats.lastError = msg;
+    pushStats.lastFailAt = Date.now();
+    wxLog(`推送失败(连续 ${pushStats.failures} 次): ${msg}`);
     return false;
   }
+}
+
+/** 向微信回报故障时限流：默认不打扰，最多 5 分钟一条 */
+async function noticeFailureToWechat(message: string): Promise<void> {
+  const now = Date.now();
+  if (now - lastPushFailureNoticeAt < PUSH_FAILURE_NOTICE_INTERVAL_MS) {
+    wxLog(`故障提示已限流，未发往微信: ${message}`);
+    return;
+  }
+  lastPushFailureNoticeAt = now;
+  await pushToWechat(message);
 }
 
 /** 发送一条文本；ret=-2 (prepare failed) 通常是 context_token 过期，自动去掉 token 重试一次 */
@@ -266,7 +338,7 @@ async function sendTextWithFallback(params: {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (params.contextToken && /ret=-2|prepare failed/i.test(msg)) {
-      console.error("[weixin] sendmessage ret=-2，尝试不带 context_token 重试");
+      wxLog("sendmessage ret=-2，尝试不带 context_token 重试");
       await sendText({ ...params, contextToken: undefined });
       return;
     }
@@ -299,12 +371,12 @@ async function startMonitor(
   const ownerDesc = otherOwnerDescription();
   if (ownerDesc && !opts.takeover) {
     const msg = `微信连接正被另一个 pi 实例持有（${ownerDesc}），本实例不重复连接。在本实例执行 /wx reconnect 可接管连接。`;
-    console.log(`[weixin] ${msg}`);
+    wxLog(msg);
     if (ctx.hasUI) ctx.ui.notify(msg, "warning");
     return;
   }
   if (ownerDesc && opts.takeover) {
-    console.log(`[weixin] 接管微信连接（原持有者: ${ownerDesc}），原实例将自动退出`);
+    wxLog(`接管微信连接（原持有者: ${ownerDesc}），原实例将自动退出`);
   }
 
   stopMonitor();
@@ -328,7 +400,7 @@ async function startMonitor(
     try {
       await notifyStart(creds.baseUrl, creds.botToken);
     } catch (err) {
-      console.error(`[weixin] notifystart 失败: ${err instanceof Error ? err.message : String(err)}`);
+      wxLog(`notifystart 失败: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     let consecutiveFailures = 0;
@@ -338,7 +410,7 @@ async function startMonitor(
       // 所有权被其他实例接管：本实例自动退出轮询
       const ownerDesc = otherOwnerDescription();
       if (ownerDesc) {
-        console.log(`[weixin] 连接已被其他实例接管（${ownerDesc}），本实例停止长轮询`);
+        wxLog(`连接已被其他实例接管（${ownerDesc}），本实例停止长轮询`);
         if (ctx.hasUI) ctx.ui.notify("微信连接已被另一个 pi 实例接管", "warning");
         stopMonitor();
         updateStatusWidget(ctx);
@@ -366,14 +438,16 @@ async function startMonitor(
           const code = resp.errcode ?? resp.ret;
           if (code === STALE_TOKEN_ERRCODE) {
             // 凭据失效：停止通道并提示重新扫码
-            console.error("[weixin] 凭据已失效 (errcode -14)，请使用 /wx 重新绑定");
+            wxLog("凭据已失效 (errcode -14)，请使用 /wx 重新绑定");
             if (ctx.hasUI) ctx.ui.notify("微信凭据已失效，请使用 /wx 重新绑定", "error");
             stopMonitor();
             updateStatusWidget(ctx);
             return;
           }
           consecutiveFailures += 1;
-          console.error(`[weixin] getupdates 错误: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""} (${consecutiveFailures}/3)`);
+          if (consecutiveFailures === 1 || consecutiveFailures % 5 === 0) {
+            wxLog(`getupdates 错误: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""} (连续 ${consecutiveFailures} 次)`);
+          }
           if (consecutiveFailures >= 3) {
             await sleep(30_000, abort.signal);
           } else {
@@ -397,7 +471,9 @@ async function startMonitor(
       } catch (err) {
         if (abort.signal.aborted || !rt || rt.stopped) break;
         consecutiveFailures += 1;
-        console.error(`[weixin] getupdates 异常 (${consecutiveFailures}/3): ${err instanceof Error ? err.message : String(err)}`);
+        if (consecutiveFailures === 1 || consecutiveFailures % 5 === 0) {
+          wxLog(`getupdates 异常 (连续 ${consecutiveFailures} 次): ${err instanceof Error ? err.message : String(err)}`);
+        }
         await sleep(consecutiveFailures >= 3 ? 30_000 : 2_000, abort.signal);
       }
     }
@@ -542,8 +618,8 @@ async function handleInbound(
     }
   } catch (err) {
     if (rt) rt.pendingFromWechat = false;
-    console.error(`[weixin] 消息下发失败: ${String(err)}`);
-    await pushToWechat(`消息下发失败: ${err instanceof Error ? err.message : String(err)}`);
+    wxLog(`消息下发失败: ${String(err)}`);
+    await noticeFailureToWechat(`消息下发失败: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -552,7 +628,7 @@ async function handleInbound(
 // ---------------------------------------------------------------------------
 
 /** 从当前会话分支取最后一条有文本内容的 assistant 消息（不含工具调用/思考） */
-function lastAssistantText(ctx: ExtensionContext): string | null {
+function lastAssistantEntry(ctx: ExtensionContext): { id: string; text: string } | null {
   const entries = ctx.sessionManager.getBranch();
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const entry = entries[i];
@@ -564,7 +640,7 @@ function lastAssistantText(ctx: ExtensionContext): string | null {
       .map((c) => (c.text as string).trim())
       .join("\n\n")
       .trim();
-    if (text) return text;
+    if (text) return { id: String(entry.id ?? ""), text };
   }
   return null;
 }
@@ -912,6 +988,8 @@ export default function weixinAgent(pi: ExtensionAPI) {
     if (creds) {
       await startMonitor(pi, ctx, creds);
     }
+    // 记住当前最后一条回复，避免重启/重载后把已发过的回复当成“本轮新结果”再推一次
+    lastPushedEntryId = lastAssistantEntry(ctx)?.id ?? null;
     updateStatusWidget(ctx);
   });
 
@@ -929,20 +1007,31 @@ export default function weixinAgent(pi: ExtensionAPI) {
     // 静默模式下只回微信下发的任务
     if (!pending && loadSilent()) return;
     try {
-      const text = lastAssistantText(ctx);
-      if (text) {
-        // 加会话前缀，多实例时可在微信里区分结果来源
-        const label = pi.getSessionName() || path.basename(ctx.cwd);
-        await pushToWechat(text, { prefix: `[${label}] ` });
-      } else if (pending) {
-        await pushToWechat("(任务已完成，无文本输出)");
+      const last = lastAssistantEntry(ctx);
+      if (!last) {
+        if (pending) await pushToWechat("(任务已完成，无文本输出)");
+        return;
+      }
+      if (last.id === lastPushedEntryId) {
+        // 自动续跑（goal 继续 / 重试 / 仅工具调用的续轮）不会有新文本，
+        // 再推一次就是把上一条回复重复发给用户
+        wxLog(`跳过重复推送（条目 ${last.id} 已推送过）`);
+        return;
+      }
+      const label = pi.getSessionName() || path.basename(ctx.cwd);
+      const ok = await pushToWechat(last.text, { prefix: `[${label}] ` });
+      if (ok) {
+        lastPushedEntryId = last.id;
+      } else {
+        // 推送失败不算已发，留给下一次 settle 重试（不丢结果）
+        wxLog(`推送未成功，条目 ${last.id} 保留待重试`);
       }
     } catch (err) {
-      console.error(`[weixin] 结果推送失败: ${String(err)}`);
+      wxLog(`结果推送失败: ${String(err)}`);
     }
   });
 
-  const WX_SUBCOMMANDS = ["status", "stop", "reconnect", "unbind", "widget", "help"];
+  const WX_SUBCOMMANDS = ["status", "stop", "reconnect", "unbind", "widget", "debug", "help"];
 
   function wxHelp(ctx: ExtensionContext): void {
     const lines = [
@@ -952,6 +1041,7 @@ export default function weixinAgent(pi: ExtensionAPI) {
       "/wx reconnect        接管连接（从其他 pi 实例抢过来）",
       "/wx unbind           解绑并清除本地凭据",
       "/wx widget [on|off]  开关输入框上方的微信状态提示",
+      "/wx debug [on|off]   后台日志是否输出到终端（默认关，日志文件始终写入）",
       "/wx help             显示本帮助",
     ];
     if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
@@ -982,6 +1072,18 @@ export default function weixinAgent(pi: ExtensionAPI) {
         else console.log(`[weixin] ${msg}`);
         return;
       }
+      if (sub === "debug" || sub.startsWith("debug ")) {
+        const arg = sub.slice("debug".length).trim();
+        const current = loadDebugEnabled();
+        const next = arg === "on" ? true : arg === "off" ? false : !current;
+        writeSettings({ debug: next });
+        const msg = next
+          ? `已开启终端调试输出（后台日志也写入 ${LOG_FILE}）`
+          : `已关闭终端调试输出（后台日志仍写入 ${LOG_FILE}）`;
+        if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        else console.log(`[weixin] ${msg}`);
+        return;
+      }
       if (sub === "" || sub === "status") {
         if (sub === "status") {
           const creds = loadCredentials();
@@ -989,14 +1091,22 @@ export default function weixinAgent(pi: ExtensionAPI) {
           const ownerLine = owner
             ? `连接持有者: pid=${owner.pid}（${owner.pid === process.pid ? "本实例" : `会话=${owner.session || "未知"}`}）`
             : "连接持有者: 无";
+          const pushLine =
+            pushStats.failures > 0
+              ? `结果推送: 连续失败 ${pushStats.failures} 次（最近 ${new Date(pushStats.lastFailAt).toLocaleTimeString()}: ${pushStats.lastError}）`
+              : pushStats.lastSuccessAt
+                ? `结果推送: 正常（最近 ${new Date(pushStats.lastSuccessAt).toLocaleTimeString()}）`
+                : "结果推送: 尚无推送";
           const lines = [
             `绑定状态: ${creds ? `已绑定 (bot=${creds.botId.slice(0, 8)}…)` : "未绑定"}`,
             `通道状态: ${rt && !rt.stopped ? "运行中" : "已停止"}`,
             ownerLine,
             `最近轮询: ${rt?.lastPollAt ? new Date(rt.lastPollAt).toLocaleTimeString() : "-"}`,
+            pushLine,
             `pi 状态: ${ctx.isIdle() ? "空闲" : "正在执行任务"}`,
             `推送模式: ${loadSilent() ? "静默（仅微信任务回结果）" : "全部推送"}`,
             `凭据目录: ${STATE_DIR}`,
+            `日志文件: ${LOG_FILE}${loadDebugEnabled() ? "（终端调试输出已开启）" : ""}`,
           ];
           if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
           else console.log(lines.join("\n"));
