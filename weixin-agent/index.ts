@@ -233,6 +233,8 @@ type Runtime = {
   contextTokens: Record<string, string>;
   /** 当前任务是否由微信消息触发（用于结束时补充空结果提示） */
   pendingFromWechat: boolean;
+  /** 微信任务进入 pi 的时刻（用于测量端到端延迟） */
+  pendingSince: number;
   lastPollAt: number;
 };
 
@@ -254,6 +256,33 @@ const pushStats = {
 /** 微信侧故障回报的最小间隔，避免反复刷屏 */
 const PUSH_FAILURE_NOTICE_INTERVAL_MS = 5 * 60_000;
 let lastPushFailureNoticeAt = 0;
+
+/** 微信任务「早推」去抖：回复文本产生后等这么久仍没落定就先推一次（可用 WEIXIN_EARLY_PUSH_MS 覆盖，便于测试） */
+const EARLY_PUSH_DELAY_MS = Number(process.env.WEIXIN_EARLY_PUSH_MS ?? "") || 20_000;
+let earlyPushTimer: ReturnType<typeof setTimeout> | null = null;
+let earlyPushCtx: ExtensionContext | null = null;
+
+function clearEarlyPushTimer(): void {
+  if (earlyPushTimer) clearTimeout(earlyPushTimer);
+  earlyPushTimer = null;
+  earlyPushCtx = null;
+}
+
+/** 重建去抖计时器：连续多条文本只推最后一条 */
+function armEarlyPush(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  if (earlyPushTimer) clearTimeout(earlyPushTimer);
+  earlyPushCtx = ctx;
+  earlyPushTimer = setTimeout(() => {
+    earlyPushTimer = null;
+    const capturedCtx = earlyPushCtx;
+    earlyPushCtx = null;
+    if (!capturedCtx || !rt || rt.stopped || !rt.pendingFromWechat) return;
+    void pushLatestAssistant(capturedCtx, pi, "微信任务早推").catch((err) =>
+      wxLog(`早推异常: ${String(err)}`),
+    );
+  }, EARLY_PUSH_DELAY_MS);
+  earlyPushTimer.unref?.();
+}
 
 /**
  * 已成功推送过的 assistant 消息条目 id。
@@ -390,6 +419,7 @@ async function startMonitor(
     monitorTask: Promise.resolve(),
     contextTokens: loadContextTokens(),
     pendingFromWechat: false,
+    pendingSince: 0,
     lastPollAt: 0,
   };
 
@@ -608,16 +638,29 @@ async function handleInbound(
   }
 
   // ---- 普通文本：作为用户消息转发给 pi ----
-  if (rt) rt.pendingFromWechat = true;
+  const queued = !ctx.isIdle();
+  if (rt) {
+    rt.pendingFromWechat = true;
+    rt.pendingSince = Date.now();
+  }
+  const serverLagS = msg.create_time_ms
+    ? Math.round((Date.now() - msg.create_time_ms) / 1000)
+    : -1;
+  wxLog(
+    `收到微信任务（微信发出→本机 ${serverLagS}s；pi ${queued ? "忙，已排队 followUp" : "空闲，立即执行"}）`,
+  );
   if (ctx.hasUI) ctx.ui.notify(`微信消息: ${text.slice(0, 50)}`, "info");
   try {
-    if (ctx.isIdle()) {
-      pi.sendUserMessage(text);
-    } else {
+    if (queued) {
       pi.sendUserMessage(text, { deliverAs: "followUp" });
+    } else {
+      pi.sendUserMessage(text);
     }
   } catch (err) {
-    if (rt) rt.pendingFromWechat = false;
+    if (rt) {
+      rt.pendingFromWechat = false;
+      rt.pendingSince = 0;
+    }
     wxLog(`消息下发失败: ${String(err)}`);
     await noticeFailureToWechat(`消息下发失败: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -628,7 +671,7 @@ async function handleInbound(
 // ---------------------------------------------------------------------------
 
 /** 从当前会话分支取最后一条有文本内容的 assistant 消息（不含工具调用/思考） */
-function lastAssistantEntry(ctx: ExtensionContext): { id: string; text: string } | null {
+function lastAssistantEntry(ctx: ExtensionContext): { id: string; text: string; ts: number } | null {
   const entries = ctx.sessionManager.getBranch();
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const entry = entries[i];
@@ -640,9 +683,52 @@ function lastAssistantEntry(ctx: ExtensionContext): { id: string; text: string }
       .map((c) => (c.text as string).trim())
       .join("\n\n")
       .trim();
-    if (text) return { id: String(entry.id ?? ""), text };
+    if (text) {
+      const ts = Date.parse(String((entry as { timestamp?: string }).timestamp ?? ""));
+      return { id: String(entry.id ?? ""), text, ts: Number.isFinite(ts) ? ts : 0 };
+    }
   }
   return null;
+}
+
+/**
+ * 推送「最新一条带文本的 assistant 回复」，并记录端到端延迟。
+ *
+ * 返回：
+ *  - pushed  推送成功
+ *  - skipped 该条目已推送过（自动续跑/重试重复落定）
+ *  - empty   还没有带文本的回复
+ *  - failed  推送失败（未标记已送达，下次落定/早推重试）
+ */
+async function pushLatestAssistant(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  reason: string,
+): Promise<"pushed" | "skipped" | "empty" | "failed"> {
+  if (!rt || rt.stopped) return "empty";
+  const last = lastAssistantEntry(ctx);
+  if (!last) return "empty";
+  if (last.id === lastPushedEntryId) {
+    // 自动续跑（goal 继续 / 重试 / 仅工具调用的续轮）不会有新文本，
+    // 再推一次就是把上一条回复重复发给用户
+    wxLog(`跳过重复推送（条目 ${last.id} 已推送过，来源=${reason}）`);
+    return "skipped";
+  }
+  const label = pi.getSessionName() || path.basename(ctx.cwd);
+  const ok = await pushToWechat(last.text, { prefix: `[${label}] ` });
+  if (!ok) {
+    wxLog(`推送未成功（来源=${reason}），条目 ${last.id} 保留待重试`);
+    return "failed";
+  }
+  lastPushedEntryId = last.id;
+  const textLag = last.ts ? Math.round((Date.now() - last.ts) / 1000) : -1;
+  const taskLag = rt.pendingSince ? Math.round((Date.now() - rt.pendingSince) / 1000) : -1;
+  wxLog(
+    `已推送 条目 ${last.id}（来源=${reason}；文本产生→送达 ${textLag}s` +
+      (taskLag >= 0 ? `；微信下发→送达 ${taskLag}s` : "") +
+      "）",
+  );
+  return "pushed";
 }
 
 // ---------------------------------------------------------------------------
@@ -995,36 +1081,45 @@ export default function weixinAgent(pi: ExtensionAPI) {
 
   // 会话结束时清理长轮询资源
   pi.on("session_shutdown", async () => {
+    clearEarlyPushTimer();
     stopMonitor();
+  });
+
+  // 微信下发的任务：回复文本一产生就先推一次，不等整轮工作结束。
+  // 实测「文本产生 → agent_settled」可相隔几分钟到几十分钟（长工具链、子代理、goal 续跑），
+  // 而微信侧的主动推送窗口很短，拖太久会直接 ret=-2 prepare failed。
+  pi.on("message_end", async (event, ctx) => {
+    if (!rt || rt.stopped || !rt.pendingFromWechat) return;
+    const message = event.message as { role?: string; content?: unknown };
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+    const hasText = (message.content as Array<{ type?: string; text?: string }>).some(
+      (c) => c.type === "text" && typeof c.text === "string" && c.text.trim().length > 0,
+    );
+    if (hasText) armEarlyPush(pi, ctx);
   });
 
   // agent 完全落定后把最终结果推回微信
   // （只推最终 assistant 回复，不含工具执行等中间过程）
   pi.on("agent_settled", async (_event, ctx) => {
     if (!rt || rt.stopped) return;
+    clearEarlyPushTimer();
     const pending = rt.pendingFromWechat;
-    rt.pendingFromWechat = false;
     // 静默模式下只回微信下发的任务
     if (!pending && loadSilent()) return;
     try {
-      const last = lastAssistantEntry(ctx);
-      if (!last) {
-        if (pending) await pushToWechat("(任务已完成，无文本输出)");
+      const res = await pushLatestAssistant(ctx, pi, "落定");
+      if (res === "empty" && pending) {
+        await pushToWechat("(任务已完成，无文本输出)");
+        if (rt) {
+          rt.pendingFromWechat = false;
+          rt.pendingSince = 0;
+        }
         return;
       }
-      if (last.id === lastPushedEntryId) {
-        // 自动续跑（goal 继续 / 重试 / 仅工具调用的续轮）不会有新文本，
-        // 再推一次就是把上一条回复重复发给用户
-        wxLog(`跳过重复推送（条目 ${last.id} 已推送过）`);
-        return;
-      }
-      const label = pi.getSessionName() || path.basename(ctx.cwd);
-      const ok = await pushToWechat(last.text, { prefix: `[${label}] ` });
-      if (ok) {
-        lastPushedEntryId = last.id;
-      } else {
-        // 推送失败不算已发，留给下一次 settle 重试（不丢结果）
-        wxLog(`推送未成功，条目 ${last.id} 保留待重试`);
+      if ((res === "pushed" || res === "skipped") && rt && pending) {
+        // 本条任务已经回复过（可能由早推完成），后续自主续跑不再当微信任务
+        rt.pendingFromWechat = false;
+        rt.pendingSince = 0;
       }
     } catch (err) {
       wxLog(`结果推送失败: ${String(err)}`);
