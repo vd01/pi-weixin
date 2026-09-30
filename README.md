@@ -80,6 +80,29 @@ cp -r weixin-agent ~/.pi/agent/extensions/
 - 扫码：`POST /ilink/bot/get_bot_qrcode` + `GET /ilink/bot/get_qrcode_status`（固定服务 `ilinkai.weixin.qq.com`）
 - 收发：`POST /ilink/bot/getupdates`（长轮询）、`/ilink/bot/sendmessage`、`/ilink/bot/msg/notifystart|notifystop`
 
+## 微信侧限制（主动推送的硬约束）
+
+微信 ClawBot / iLink 对「机器人主动发消息」有两个约束，直接决定我们能推多少、什么时候能推：
+
+| 限制 | 数值 | 依据 |
+|---|---|---|
+| 消息窗口 | 用户最后一次消息后 **24 小时**；此后 context_token 失效，无法主动触达，需用户再发一条 | 官方协议说明与腾讯 issue [#202](https://github.com/Tencent/openclaw-weixin/issues/202) |
+| 每窗口主动消息额度 | 约 **10 条** | 同上；本扩展日志实测吻合（见下） |
+| 长任务回复失效 | 社区报告长任务（~160s）后回复发不出去 | OpenClaw issue [#61174](https://github.com/openclaw/openclaw/issues/61174)（腾讯侧未确认） |
+
+本扩展 2026-09-30 的实测时间线（同一实例，日志 + 会话记录）：
+
+```
+01:05:32  用户发消息（开窗口）
+01:11~06:38  共 10 条不同回复推送全部成功
+09:41 起   连续 6 次 ret=-2 prepare failed（第 11 条开始），期间用户 8.6h 未发消息
+10:45:35  用户又发一条消息
+11:42 起   推送立即恢复成功
+```
+
+注意：**长文本按 1500 字分段，每段都算 1 条主动消息**；自主续跑（goal）的输出同样消耗额度。
+额度耗尽后只能等用户在微信里再发一条消息。
+
 ## 延迟排查
 
 `~/.pi/agent/weixin/weixin.log` 每次都会记录三段可核算的延迟，出问题时直接看这个文件：
@@ -87,9 +110,11 @@ cp -r weixin-agent ~/.pi/agent/extensions/
 | 日志行 | 含义 |
 |---|---|
 | `收到微信任务（微信发出→本机 Ns；pi 忙，已排队 followUp / 空闲，立即执行）` | 微信→本机的链路延迟，以及是否卡在 pi 的排队里 |
-| `已推送 条目 xxx（来源=微信任务早推/落定；文本产生→送达 Ns；微信下发→送达 Ns）` | 回复文本产生到真正送出的延迟（`文本产生→送达` 大即推送时机问题；`微信下发→送达` 大即 pi 处理/排队耗时） |
-| `推送失败(连续 N 次): sendmessage ret=-2 errmsg=prepare failed` | 微信侧拒收，通常是距离用户上一次消息太久（会话窗口过期）；会让用户下次发消息后才能收到 |
+| `已推送 条目 xxx（来源=微信任务早推/落定；文本产生→送达 Ns；微信下发→送达 Ns；本窗口第 N 条主动消息）` | 回复文本产生到真正送出的延迟，以及额度消耗进度 |
+| `推送失败(连续 N 次): sendmessage ret=-2 errmsg=prepare failed（token 年龄 Ns；本窗口已发 N 条主动消息）` | 微信侧拒收：额度耗尽（≈10 条）或空闲超过窗口；用 `token 年龄` 与已发条数即可区分 |
+| `收到新消息，主动消息计数归零（上一窗口已发 N 条）` | 用户新消息重置额度，同时告诉你上一窗口用了多少条 |
 
+`/wx status` 会同样显示「主动消息: 本窗口已发 N 条（token 年龄 Ns）」。
 微信主动推送有会话窗口限制：长时间不交互后，即使发出去也可能被 `ret=-2 prepare failed` 拒掉，
 重新在微信里发一条消息即可恢复。
 

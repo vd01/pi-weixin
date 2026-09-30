@@ -235,6 +235,10 @@ type Runtime = {
   pendingFromWechat: boolean;
   /** 微信任务进入 pi 的时刻（用于测量端到端延迟） */
   pendingSince: number;
+  /** 最近一次收到用户消息（下发 context_token）的时刻 */
+  tokenAt: number;
+  /** 本窗口已成功发出的主动消息条数（微信每会话主动消息额度有限，需计数） */
+  sentSinceInbound: number;
   lastPollAt: number;
 };
 
@@ -329,6 +333,7 @@ async function pushToWechat(text: string, opts: { prefix?: string } = {}): Promi
         text: part,
         contextToken,
       });
+      if (rt) rt.sentSinceInbound += 1;
     }
     pushStats.failures = 0;
     pushStats.lastSuccessAt = Date.now();
@@ -338,9 +343,19 @@ async function pushToWechat(text: string, opts: { prefix?: string } = {}): Promi
     pushStats.failures += 1;
     pushStats.lastError = msg;
     pushStats.lastFailAt = Date.now();
-    wxLog(`推送失败(连续 ${pushStats.failures} 次): ${msg}`);
+    wxLog(`推送失败(连续 ${pushStats.failures} 次): ${msg}${quotaNote()}`);
     return false;
   }
+}
+
+/** 额度/窗口状态描述（用于日志与 /wx status） */
+function quotaNote(): string {
+  if (!rt) return "";
+  const parts: string[] = [];
+  if (rt.tokenAt) parts.push(`token 年龄 ${Math.round((Date.now() - rt.tokenAt) / 1000)}s`);
+  else parts.push("无 context_token");
+  parts.push(`本窗口已发 ${rt.sentSinceInbound} 条主动消息`);
+  return `（${parts.join("；")}）`;
 }
 
 /** 向微信回报故障时限流：默认不打扰，最多 5 分钟一条 */
@@ -420,6 +435,8 @@ async function startMonitor(
     contextTokens: loadContextTokens(),
     pendingFromWechat: false,
     pendingSince: 0,
+    tokenAt: 0,
+    sentSinceInbound: 0,
     lastPollAt: 0,
   };
 
@@ -574,6 +591,14 @@ async function handleInbound(
 
   if (msg.context_token) {
     rt.contextTokens[from] = msg.context_token;
+    if (rt) {
+      // 新的用户消息 = 可能开一个新窗口，主动消息额度可能重置：记录上一窗口用量便于核对限额
+      if (rt.sentSinceInbound > 0) {
+        wxLog(`收到新消息，主动消息计数归零（上一窗口已发 ${rt.sentSinceInbound} 条）`);
+      }
+      rt.tokenAt = Date.now();
+      rt.sentSinceInbound = 0;
+    }
   }
 
   const text = extractText(msg);
@@ -726,7 +751,7 @@ async function pushLatestAssistant(
   wxLog(
     `已推送 条目 ${last.id}（来源=${reason}；文本产生→送达 ${textLag}s` +
       (taskLag >= 0 ? `；微信下发→送达 ${taskLag}s` : "") +
-      "）",
+      `；本窗口第 ${rt?.sentSinceInbound ?? 0} 条主动消息）`,
   );
   return "pushed";
 }
@@ -1198,6 +1223,7 @@ export default function weixinAgent(pi: ExtensionAPI) {
             ownerLine,
             `最近轮询: ${rt?.lastPollAt ? new Date(rt.lastPollAt).toLocaleTimeString() : "-"}`,
             pushLine,
+            `主动消息: 本窗口已发 ${rt?.sentSinceInbound ?? 0} 条${rt?.tokenAt ? `（token 年龄 ${Math.round((Date.now() - rt.tokenAt) / 1000)}s）` : ""}`,
             `pi 状态: ${ctx.isIdle() ? "空闲" : "正在执行任务"}`,
             `推送模式: ${loadSilent() ? "静默（仅微信任务回结果）" : "全部推送"}`,
             `凭据目录: ${STATE_DIR}`,
