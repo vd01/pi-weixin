@@ -18,6 +18,7 @@ import {
 const NUDGE_MS = 400;
 process.env.WEIXIN_NUDGE_MS = String(NUDGE_MS);
 process.env.WEIXIN_NUDGE_REACTION_TIMEOUT_MS = "1200";
+process.env.WEIXIN_NUDGE_MERGE_MS = "600"; // 合并窗口（无文本回复多久后单独补状态）
 process.env.WEIXIN_EARLY_PUSH_MS = "200";
 
 const USER = "u1@im.wechat";
@@ -159,9 +160,10 @@ host.handlers.tool_execution_start[0](
   { toolCallId: "tc-H", toolName: "bash", args: { command: "python3 ssl_train.py --leg H" } },
   ctx,
 );
-await sleep(1500); // 期间不产生文本回复
+await sleep(1100); // 合并窗口 600ms，期间不产生文本回复
 const fb = stub.sent.slice(beforeFallback).join("\n");
-check("无文本回复时兜底推状态", /agent 已继续执行但暂无文本回复/.test(fb) && /\[状态\]/.test(fb), fb.slice(0, 200));
+check("无文本回复时 1 秒级补状态（不等 5 分钟）", /agent 已继续执行但暂无文本回复/.test(fb) && /\[状态\]/.test(fb), fb.slice(0, 200));
+check("兜底推送有结果留痕", /催办状态\(兜底\)推送成功/.test(logText()), "");
 
 check("终端保持安静", term.length === 0, JSON.stringify(term));
 

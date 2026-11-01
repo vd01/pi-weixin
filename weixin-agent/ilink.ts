@@ -297,6 +297,15 @@ export async function getUpdates(params: {
 }
 
 /** 发送一条文本消息。contextToken 回传会话上下文，主动推送时传最近一次收到的值。 */
+export interface SendMessageResp {
+  ret?: number;
+  errmsg?: string;
+  /** 服务端分配的消息 id（用于核对是否真的投递） */
+  msg_id?: number | string;
+  message_id?: number | string;
+  [key: string]: unknown;
+}
+
 export async function sendText(params: {
   baseUrl: string;
   token: string;
@@ -304,7 +313,7 @@ export async function sendText(params: {
   text: string;
   contextToken?: string;
   timeoutMs?: number;
-}): Promise<void> {
+}): Promise<SendMessageResp> {
   const body = {
     msg: {
       from_user_id: "",
@@ -317,7 +326,7 @@ export async function sendText(params: {
     },
     base_info: baseInfo(),
   };
-  const resp = await postJSON<{ ret?: number; errmsg?: string }>({
+  const resp = await postJSON<SendMessageResp>({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/sendmessage",
     body,
@@ -328,6 +337,7 @@ export async function sendText(params: {
   if (resp.ret && resp.ret !== 0) {
     throw new Error(`sendmessage ret=${resp.ret} errmsg=${resp.errmsg ?? "(none)"}`);
   }
+  return resp;
 }
 
 /** 发送/取消“正在输入”状态。status: 1=输入中, 2=取消。需要先 getConfig 拿 typing_ticket。 */

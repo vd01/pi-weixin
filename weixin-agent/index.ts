@@ -35,6 +35,7 @@ import {
   sendText,
   STALE_TOKEN_ERRCODE,
   type Credentials,
+  type SendMessageResp,
   type WeixinMessage,
 } from "./ilink";
 import { collectSysInfo } from "./sysinfo";
@@ -324,17 +325,25 @@ function chunkText(text: string, max = 1500): string[] {
   return chunks;
 }
 
-async function pushToWechat(text: string, opts: { prefix?: string } = {}): Promise<boolean> {
-  if (!rt || rt.stopped) return false;
+async function pushToWechat(
+  text: string,
+  opts: { prefix?: string; label?: string } = {},
+): Promise<boolean> {
+  if (!rt || rt.stopped) {
+    if (opts.label) wxLog(`${opts.label}：通道未运行，未发送`);
+    return false;
+  }
   const { creds } = rt;
   const contextToken = rt.contextTokens[creds.userId];
   const fullText = opts.prefix ? `${opts.prefix}${text}` : text;
+  const label = opts.label ?? "推送";
   try {
     let first = true;
+    const ids: string[] = [];
     for (const part of chunkText(fullText)) {
       if (!first) await new Promise((r) => setTimeout(r, 300)); // 分段间隔，避免突发被拒
       first = false;
-      await sendTextWithFallback({
+      const resp = await sendTextWithFallback({
         baseUrl: creds.baseUrl,
         token: creds.botToken,
         toUserId: creds.userId,
@@ -342,9 +351,14 @@ async function pushToWechat(text: string, opts: { prefix?: string } = {}): Promi
         contextToken,
       });
       if (rt) rt.sentSinceInbound += 1;
+      const id = resp && (resp.msg_id ?? resp.message_id);
+      if (id !== undefined && id !== null) ids.push(String(id));
     }
     pushStats.failures = 0;
     pushStats.lastSuccessAt = Date.now();
+    if (opts.label) {
+      wxLog(`${label}：已提交微信 ${ids.length > 0 ? `（msg_id=${ids.join(",")}）` : ""}`);
+    }
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -384,15 +398,14 @@ async function sendTextWithFallback(params: {
   toUserId: string;
   text: string;
   contextToken?: string;
-}): Promise<void> {
+}): Promise<SendMessageResp | undefined> {
   try {
-    await sendText(params);
+    return await sendText(params);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (params.contextToken && /ret=-2|prepare failed/i.test(msg)) {
       wxLog("sendmessage ret=-2，尝试不带 context_token 重试");
-      await sendText({ ...params, contextToken: undefined });
-      return;
+      return await sendText({ ...params, contextToken: undefined });
     }
     throw err;
   }
@@ -743,6 +756,13 @@ async function interruptAndAskReport(pi: ExtensionAPI, ctx: ExtensionContext): P
 // ---------------------------------------------------------------------------
 
 const NUDGE_DELAY_MS = Number(process.env.WEIXIN_NUDGE_MS ?? "") || 3 * 60_000;
+/**
+ * 「合并窗口」：agent 已响应，但迟迟没写文本回复时，等这么久就单独补一条状态。
+ * 注意不能太长 —— 实测 agent 响应后可能连续调工具 5 分钟不写文字，
+ * 若沿用「完全无响应」的 5 分钟，用户在微信里会以为完全没回报。
+ */
+const NUDGE_MERGE_WINDOW_MS = Number(process.env.WEIXIN_NUDGE_MERGE_MS ?? "") || 60_000;
+/** 完全没响应（连 agent_start 都没来）时才用这个长超时 */
 const NUDGE_REACTION_TIMEOUT_MS =
   Number(process.env.WEIXIN_NUDGE_REACTION_TIMEOUT_MS ?? "") || 5 * 60_000;
 const NUDGE_MAX_ATTEMPTS = Number(process.env.WEIXIN_NUDGE_MAX ?? "") || 2;
@@ -856,6 +876,7 @@ async function fireNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void>
     wxLog(`已发「继续」但 ${fmtDuration(NUDGE_REACTION_TIMEOUT_MS)} 内 agent 未响应`);
     void pushToWechat(
       `已发送「继续」，但 agent 在 ${fmtDuration(NUDGE_REACTION_TIMEOUT_MS)} 内没有响应，已停止催办。`,
+      { label: "催办无响应回报" },
     );
   }, NUDGE_REACTION_TIMEOUT_MS);
   nudgeState.reactionTimer.unref?.();
@@ -876,12 +897,14 @@ function onNudgeReaction(ctx: ExtensionContext, pi: ExtensionAPI): void {
     nudgeState.fallbackTimer = null;
     if (!nudgeState.reactionPending || !rt || rt.stopped) return;
     nudgeState.reactionPending = false;
-    wxLog(`agent 已响应「继续」但 ${fmtDuration(NUDGE_REACTION_TIMEOUT_MS)} 内无文本回复，兜底推一条状态`);
+    wxLog(`agent 已响应「继续」但 ${fmtDuration(NUDGE_MERGE_WINDOW_MS)} 内没写回复，单独补一条状态`);
     const suffix = await statusSuffixLines(ctx);
-    await pushToWechat(
+    const ok = await pushToWechat(
       [`已发「继续」（第 ${nudgeState.attempts} 次），agent 已继续执行但暂无文本回复。`].concat(suffix).join("\n"),
+      { label: "催办状态(兜底)" },
     );
-  }, NUDGE_REACTION_TIMEOUT_MS);
+    wxLog(`催办状态(兜底)推送${ok ? "成功" : "失败"}`);
+  }, NUDGE_MERGE_WINDOW_MS);
   nudgeState.fallbackTimer.unref?.();
   wxLog(`agent 已响应「继续」，状态将合并进它的下一条回复`);
 }
@@ -1099,7 +1122,10 @@ async function pushLatestAssistant(
     const suffix = await statusSuffixLines(ctx);
     if (suffix.length > 0) body = `${last.text}\n\n————\n${suffix.join("\n")}`;
   }
-  const ok = await pushToWechat(body, { prefix: `[${label}] ` });
+  const ok = await pushToWechat(body, {
+    prefix: `[${label}] `,
+    label: mergeStatus ? "催办状态(合并)" : undefined,
+  });
   if (!ok) {
     wxLog(`推送未成功（来源=${reason}），条目 ${last.id} 保留待重试`);
     return "failed";
