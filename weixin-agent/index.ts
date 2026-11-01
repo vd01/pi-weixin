@@ -37,6 +37,7 @@ import {
   type Credentials,
   type WeixinMessage,
 } from "./ilink";
+import { collectSysInfo } from "./sysinfo";
 
 // ---------------------------------------------------------------------------
 // 持久化存储
@@ -566,6 +567,166 @@ function extractText(msg: WeixinMessage): string {
   return parts.join("\n").trim();
 }
 
+// ---------------------------------------------------------------------------
+// 执行状态观测（供微信「状态」「打断」使用；纯观测，不影响正在执行的 agent）
+// ---------------------------------------------------------------------------
+
+type RecentAction = { tool: string; detail: string; startedAt: number; endedAt?: number; isError?: boolean };
+
+const activity = {
+  runStartedAt: 0,
+  current: null as null | { tool: string; detail: string; startedAt: number; toolCallId: string },
+  recent: [] as RecentAction[],
+};
+
+function clip(text: string, max: number): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
+}
+
+function fmtDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+}
+
+/** 从工具名+参数里抽出能看懂的一行摘要 */
+function toolDetail(toolName: string, args: unknown): string {
+  const a = (args ?? {}) as Record<string, unknown>;
+  const pick = (k: string) => (typeof a[k] === "string" ? (a[k] as string) : "");
+  const raw =
+    toolName === "bash"
+      ? pick("command")
+      : pick("path") || pick("pattern") || pick("query") || pick("url") || pick("command");
+  return clip(raw, 70);
+}
+
+/** 本轮任务的来源消息（最近一条 user 消息） */
+function lastUserTask(ctx: ExtensionContext): { text: string; at: number } | null {
+  const entries = ctx.sessionManager.getBranch();
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i];
+    if (entry.type !== "message") continue;
+    const message = entry.message as { role?: string; content?: unknown };
+    if (message.role !== "user" || !Array.isArray(message.content)) continue;
+    const text = (message.content as Array<{ type?: string; text?: string }>)
+      .filter((c) => c.type === "text" && typeof c.text === "string" && c.text.trim())
+      .map((c) => (c.text as string).trim())
+      .join(" ");
+    if (!text) continue;
+    const at = Date.parse(String((entry as { timestamp?: string }).timestamp ?? ""));
+    return { text, at: Number.isFinite(at) ? at : 0 };
+  }
+  return null;
+}
+
+/** 从最近一条 assistant 回复里摘计划行（找不到就取末尾一行） */
+function planLines(ctx: ExtensionContext): string[] {
+  const last = lastAssistantEntry(ctx);
+  if (!last) return [];
+  const lines = last.text
+    .split("\n")
+    .map((l) => l.replace(/^[\s>*\-\d.、）)]+/, "").trim())
+    .filter(Boolean);
+  const hit = lines.filter((l) => /(下一步|接下来|计划|后续|待办|TODO|next step|plan)/i.test(l)).slice(0, 2);
+  return (hit.length > 0 ? hit : lines.slice(-1)).map((l) => clip(l, 80));
+}
+
+/**
+ * 微信「状态」（agent 忙时）：不打断执行，只用可观测信息 + 本机资源做简短总结。
+ * 不调用 sendUserMessage，不触发任何模型请求。
+ */
+async function buildBusySummary(ctx: ExtensionContext): Promise<string> {
+  const lines: string[] = [];
+  const runMs = activity.runStartedAt ? Date.now() - activity.runStartedAt : 0;
+  lines.push(`状态: 执行中${runMs > 0 ? `（已 ${fmtDuration(runMs)}）` : ""}`);
+
+  const task = lastUserTask(ctx);
+  if (task) lines.push(`任务: ${clip(task.text, 64)}`);
+
+  if (activity.current) {
+    const age = fmtDuration(Date.now() - activity.current.startedAt);
+    const detail = activity.current.detail ? ` · ${activity.current.detail}` : "";
+    lines.push(`当前: ${activity.current.tool}${detail}（已 ${age}）`);
+  } else if (ctx.hasPendingMessages()) {
+    lines.push("当前: 等待模型响应（有排队消息）");
+  } else {
+    lines.push("当前: 模型生成中/等待工具结果");
+  }
+
+  const recent = activity.recent.filter((r) => r.endedAt).slice(-5);
+  if (recent.length > 0) {
+    lines.push(`最近: ${recent.map((r) => `${r.tool}${r.isError ? "(失败)" : ""}`).join(" → ")}`);
+  }
+
+  const plan = planLines(ctx);
+  lines.push(plan.length > 0 ? `计划: ${plan.join(" / ")}` : "计划: 最近回复未写明，需要问它本人");
+
+  lines.push(...(await collectSysInfo()));
+  lines.push(`模型: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "?"}`);
+  return lines.join("\n");
+}
+
+/**
+ * 微信「打断」：终止当前执行 → 让它先汇报现状与后续计划 → 之后进入正常对话。
+ * 先取快照再 abort，避免丢信息（abort 会杀掉前台工具子进程，后台 nohup 进程不受影响）。
+ */
+async function interruptAndAskReport(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+  const task = lastUserTask(ctx);
+  const current = activity.current;
+  const recent = activity.recent.filter((r) => r.endedAt).slice(-5);
+
+  ctx.abort();
+
+  await pushToWechat(
+    [
+      "已中断当前执行，正在让它汇报现状。",
+      "注意: 前台命令会被终止；nohup/setsid 起的后台进程不受影响。",
+    ].join("\n"),
+  );
+  if (rt) {
+    rt.pendingFromWechat = true;
+    rt.pendingSince = Date.now();
+  }
+
+  const snapshot = [
+    task ? `- 我记录到的任务: ${clip(task.text, 80)}` : "",
+    current
+      ? `- 中断时正在运行: ${current.tool}${current.detail ? ` · ${current.detail}` : ""}（已 ${fmtDuration(Date.now() - current.startedAt)}）`
+      : "",
+    recent.length > 0
+      ? `- 中断前最近动作: ${recent.map((r) => `${r.tool}${r.isError ? "(失败)" : ""}`).join(" → ")}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const prompt = [
+    "【微信中断指令】你刚被用户在微信里打断，当前这一轮已经终止。",
+    "请先只做回答（不要调用任何工具，不超过 6 行）：",
+    "1) 打断时你正在做什么、停在哪一步；",
+    "2) 接下来的计划（按优先级 2-3 条）；",
+    "3) 是否已有后台进程/训练在跑（nohup/setsid），需不需要用户确认。",
+    "回答完就停下等用户下一步指令，不要自行继续执行。",
+    snapshot ? `\n扩展侧快照：\n${snapshot}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  // abort 是异步的：等它真正停下（最多 5s），让汇报指令能立即开跑
+  const deadline = Date.now() + 5_000;
+  while (!ctx.isIdle() && Date.now() < deadline) {
+    await sleep(100);
+  }
+
+  // abort 之后仍可能没完全 idle：忙则排队为 followUp，确保这条指令一定被投递
+  if (ctx.isIdle()) pi.sendUserMessage(prompt);
+  else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+  wxLog(`已执行微信「打断」并请求现状汇报（前台工具已终止）`);
+}
+
 async function handleInbound(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -613,8 +774,9 @@ async function handleInbound(
       [
         "pi 微信命令：",
         "- 直接发送任意文本：作为任务下发给 pi，完成后自动推送最终结果",
-        "- 状态：查看 pi 当前状态",
-        "- 停止：中断当前任务",
+        "- 状态：空闲时只回“空闲”；执行中不打断，返回任务/当前动作/计划 + CPU/GPU",
+        "- 打断：终止当前执行，让它先汇报现状与后续计划，之后进入正常对话",
+        "- 停止：仅中断当前任务（不要求汇报）",
         "- 静默：切换结果推送模式（开启后仅微信下发的任务回结果）",
         "- 解绑：解除微信绑定",
       ].join("\n"),
@@ -622,17 +784,20 @@ async function handleInbound(
     return;
   }
   if (text === "状态") {
-    const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "未知";
-    const busy = !ctx.isIdle();
-    const session = pi.getSessionName() || "默认会话";
-    await pushToWechat(
-      [
-        `pi 状态: ${busy ? "正在执行任务…" : "空闲"}`,
-        `模型: ${model}`,
-        `会话: ${session}`,
-        `微信通道: 已连接`,
-      ].join("\n"),
-    );
+    // 空闲：不输出无关信息；忙：纯观测汇总，不打断执行
+    if (ctx.isIdle()) {
+      await pushToWechat("空闲");
+      return;
+    }
+    await pushToWechat(await buildBusySummary(ctx));
+    return;
+  }
+  if (text === "打断" || text === "中断") {
+    if (ctx.isIdle()) {
+      await pushToWechat("空闲，没有在跑的任务，直接说要做什么就行。");
+      return;
+    }
+    await interruptAndAskReport(pi, ctx);
     return;
   }
   if (text === "停止") {
@@ -1123,10 +1288,36 @@ export default function weixinAgent(pi: ExtensionAPI) {
     if (hasText) armEarlyPush(pi, ctx);
   });
 
+  // 执行状态观测（「状态」「打断」用）：只记录，不干预
+  pi.on("agent_start", async () => {
+    activity.runStartedAt = Date.now();
+    activity.current = null;
+  });
+
+  pi.on("tool_execution_start", async (event) => {
+    if (!activity.runStartedAt) activity.runStartedAt = Date.now();
+    const startedAt = Date.now();
+    const detail = toolDetail(event.toolName, event.args);
+    activity.current = { tool: event.toolName, detail, startedAt, toolCallId: event.toolCallId };
+    activity.recent.push({ tool: event.toolName, detail, startedAt });
+    if (activity.recent.length > 12) activity.recent.splice(0, activity.recent.length - 12);
+  });
+
+  pi.on("tool_execution_end", async (event) => {
+    if (activity.current?.toolCallId === event.toolCallId) activity.current = null;
+    const last = activity.recent[activity.recent.length - 1];
+    if (last && !last.endedAt && last.tool === event.toolName) {
+      last.endedAt = Date.now();
+      last.isError = event.isError;
+    }
+  });
+
   // agent 完全落定后把最终结果推回微信
   // （只推最终 assistant 回复，不含工具执行等中间过程）
   pi.on("agent_settled", async (_event, ctx) => {
     if (!rt || rt.stopped) return;
+    activity.current = null;
+    activity.runStartedAt = 0;
     clearEarlyPushTimer();
     const pending = rt.pendingFromWechat;
     // 静默模式下只回微信下发的任务
