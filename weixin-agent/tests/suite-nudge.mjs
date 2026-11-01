@@ -18,7 +18,7 @@ import {
 const NUDGE_MS = 400;
 process.env.WEIXIN_NUDGE_MS = String(NUDGE_MS);
 process.env.WEIXIN_NUDGE_REACTION_TIMEOUT_MS = "1200";
-process.env.WEIXIN_NUDGE_MERGE_MS = "600"; // 合并窗口（无文本回复多久后单独补状态）
+process.env.WEIXIN_NUDGE_MERGE_MS = "2000"; // 合并窗口（无文本回复多久后单独补状态）
 process.env.WEIXIN_EARLY_PUSH_MS = "200";
 
 const USER = "u1@im.wechat";
@@ -160,10 +160,34 @@ host.handlers.tool_execution_start[0](
   { toolCallId: "tc-H", toolName: "bash", args: { command: "python3 ssl_train.py --leg H" } },
   ctx,
 );
-await sleep(1100); // 合并窗口 600ms，期间不产生文本回复
+await sleep(2400); // 合并窗口 2s，期间不产生文本回复
 const fb = stub.sent.slice(beforeFallback).join("\n");
-check("无文本回复时 1 秒级补状态（不等 5 分钟）", /agent 已继续执行但暂无文本回复/.test(fb) && /\[状态\]/.test(fb), fb.slice(0, 200));
+check("无文本回复时按合并窗口补状态（不等 5 分钟）", /agent 已继续执行但没写文本回复/.test(fb) && /\[状态\]/.test(fb), fb.slice(0, 200));
 check("兜底推送有结果留痕", /催办状态\(兜底\)推送成功/.test(logText()), "");
+
+// ── 11) 反应后本轮落定、但没有新增文本 → 落定时立刻补报（实测漏报点）
+host.outbound.length = 0;
+const beforeSettleReport = stub.sent.length;
+stub.state.inbox = [weixinInbound("跑 I 腿", USER)];
+await sleep(350);
+branchRef.value = [...branchRef.value, msgEntry("a-I", "I 腿已开始。下一步：等待训练结束。")];
+host.handlers.message_end[0]({ message: { role: "assistant", content: [{ type: "text", text: "I 腿已开始。下一步：等待训练结束。" }] } }, ctx);
+await sleep(300);
+host.flags.idle = true;
+await host.handlers.agent_settled[0]({}, ctx);          // 回复已推 + 安排催办
+await sleep(NUDGE_MS + 200);
+check("已发「继续」(I 腿)", nudges() === 1, `nudges=${nudges()}`);
+const beforeI = stub.sent.length;
+host.flags.idle = false;
+host.handlers.agent_start[0]({}, ctx);                   // 有反应
+await sleep(120);                                        // 远小于 2s 合并窗口
+host.flags.idle = true;                                  // 本轮没写文本就落定
+await host.handlers.agent_settled[0]({}, ctx);
+await sleep(400);
+const iReports = stub.sent.slice(beforeI);
+check("落定无新文本时立刻补报状态", iReports.length === 1 && /agent 已继续执行但没写文本回复/.test(iReports[0]), JSON.stringify(iReports));
+check("补报带状态/资源行", /\[状态\]/.test(iReports[0] ?? "") && /\[资源\]/.test(iReports[0] ?? ""), iReports[0] ?? "");
+check("补报留痕", /催办状态\(兜底\)推送成功（本轮落定但没写回复）/.test(logText()), "");
 
 check("终端保持安静", term.length === 0, JSON.stringify(term));
 

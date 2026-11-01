@@ -792,6 +792,10 @@ function clearNudgeTimers(): void {
 
 /** 新任务/用户接管时重置催办状态 */
 function resetNudge(reason: string): void {
+  if (nudgeState.reactionPending) {
+    wxLog(`催办状态回报被取消：${reason}`);
+    nudgeState.reactionPending = false;
+  }
   clearNudgeTimers();
   nudgeState.attempts = 0;
   nudgeState.awaitingReaction = false;
@@ -882,6 +886,31 @@ async function fireNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void>
   nudgeState.reactionTimer.unref?.();
 }
 
+/**
+ * 「继续」后没能把状态合并进回复（一直没写文本 / 本轮落定也没新增文本）时，
+ * 单独补一条状态，避免微信端完全收不到反馈。幂等：只对未消费的 reactionPending 生效。
+ */
+async function flushNudgeReport(ctx: ExtensionContext, reason: string): Promise<void> {
+  if (!nudgeState.reactionPending) return;
+  nudgeState.reactionPending = false;
+  if (nudgeState.fallbackTimer) {
+    clearTimeout(nudgeState.fallbackTimer);
+    nudgeState.fallbackTimer = null;
+  }
+  if (!rt || rt.stopped) {
+    wxLog(`催办状态未能回报：微信通道未运行（${reason}）`);
+    return;
+  }
+  const suffix = await statusSuffixLines(ctx);
+  const ok = await pushToWechat(
+    [`已发「继续」（第 ${nudgeState.attempts} 次），agent 已继续执行但没写文本回复。`]
+      .concat(suffix)
+      .join("\n"),
+    { label: "催办状态(兜底)" },
+  );
+  wxLog(`催办状态(兜底)推送${ok ? "成功" : "失败"}（${reason}）`);
+}
+
 /** agent 开始干活了（对「继续」有反应）：把状态降级为「合并到它的下一条回复」 */
 function onNudgeReaction(ctx: ExtensionContext, pi: ExtensionAPI): void {
   if (!nudgeState.awaitingReaction) return;
@@ -893,17 +922,9 @@ function onNudgeReaction(ctx: ExtensionContext, pi: ExtensionAPI): void {
   }
   // 它已经开始跑，但可能一直没有文本回复（只调工具）：兜底推一条简短状态，避免完全静默
   if (nudgeState.fallbackTimer) clearTimeout(nudgeState.fallbackTimer);
-  nudgeState.fallbackTimer = setTimeout(async () => {
+  nudgeState.fallbackTimer = setTimeout(() => {
     nudgeState.fallbackTimer = null;
-    if (!nudgeState.reactionPending || !rt || rt.stopped) return;
-    nudgeState.reactionPending = false;
-    wxLog(`agent 已响应「继续」但 ${fmtDuration(NUDGE_MERGE_WINDOW_MS)} 内没写回复，单独补一条状态`);
-    const suffix = await statusSuffixLines(ctx);
-    const ok = await pushToWechat(
-      [`已发「继续」（第 ${nudgeState.attempts} 次），agent 已继续执行但暂无文本回复。`].concat(suffix).join("\n"),
-      { label: "催办状态(兜底)" },
-    );
-    wxLog(`催办状态(兜底)推送${ok ? "成功" : "失败"}`);
+    void flushNudgeReport(ctx, `${fmtDuration(NUDGE_MERGE_WINDOW_MS)} 内没写回复`);
   }, NUDGE_MERGE_WINDOW_MS);
   nudgeState.fallbackTimer.unref?.();
   wxLog(`agent 已响应「继续」，状态将合并进它的下一条回复`);
@@ -1581,6 +1602,9 @@ export default function weixinAgent(pi: ExtensionAPI) {
     } catch (err) {
       wxLog(`结果推送失败: ${String(err)}`);
     }
+    // 「继续」后的这一轮已经结束，但没有可推送的新文本：
+    // 合并进回复永远不会发生，立刻把状态补报上去（实测用户就是在这里拿不到回报）
+    await flushNudgeReport(ctx, "本轮落定但没写回复");
     // 已回复微信、但 agent 仍空闲且有后续任务 → 安排「继续」催办
     await armNudge(ctx, pi);
   });
