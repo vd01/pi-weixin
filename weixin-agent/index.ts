@@ -109,6 +109,8 @@ interface Settings {
   widget?: boolean;
   /** 后台日志是否输出到终端（默认关闭，日志文件始终写入） */
   debug?: boolean;
+  /** 微信任务回复后若 agent 仍空闲且有后续任务，是否自动发「继续」催（默认开启） */
+  nudge?: boolean;
 }
 
 function readSettings(): Settings {
@@ -150,6 +152,11 @@ const LOG_MAX_BYTES = 256 * 1024;
 function loadDebugEnabled(): boolean {
   if (process.env.WEIXIN_DEBUG === "1") return true;
   return Boolean(readSettings().debug);
+}
+
+/** 「继续」催办是否开启（默认开） */
+function loadNudgeEnabled(): boolean {
+  return readSettings().nudge !== false;
 }
 
 function wxLog(message: string): void {
@@ -727,6 +734,161 @@ async function interruptAndAskReport(pi: ExtensionAPI, ctx: ExtensionContext): P
   wxLog(`已执行微信「打断」并请求现状汇报（前台工具已终止）`);
 }
 
+// ---------------------------------------------------------------------------
+// 「继续」催办
+//
+// 条件：最近一条消息来自微信 + agent 已经回复过微信 + 还有后续任务，
+// 但 agent 却一直空闲（默认 3 分钟）→ 发「继续」把它推动起来，
+// 等它真的开始干活后，再把当前状态报告推回微信。
+// ---------------------------------------------------------------------------
+
+const NUDGE_DELAY_MS = Number(process.env.WEIXIN_NUDGE_MS ?? "") || 3 * 60_000;
+const NUDGE_REPORT_DELAY_MS = Number(process.env.WEIXIN_NUDGE_REPORT_MS ?? "") || 20_000;
+const NUDGE_REACTION_TIMEOUT_MS =
+  Number(process.env.WEIXIN_NUDGE_REACTION_TIMEOUT_MS ?? "") || 5 * 60_000;
+const NUDGE_MAX_ATTEMPTS = Number(process.env.WEIXIN_NUDGE_MAX ?? "") || 2;
+
+const nudgeState = {
+  /** 最近一条用户消息来自微信 */
+  taskFromWechat: false,
+  /** 该任务已成功把回复推到微信（“agent 回复了微信消息”成立） */
+  replyDelivered: false,
+  /** 已发出的「继续」次数 */
+  attempts: 0,
+  /** 已发「继续」，等 agent 反应 */
+  awaitingReaction: false,
+  timer: null as ReturnType<typeof setTimeout> | null,
+  reportTimer: null as ReturnType<typeof setTimeout> | null,
+  reactionTimer: null as ReturnType<typeof setTimeout> | null,
+  lastNudgeAt: 0,
+};
+
+function clearNudgeTimers(): void {
+  for (const k of ["timer", "reportTimer", "reactionTimer"] as const) {
+    const t = nudgeState[k];
+    if (t) clearTimeout(t);
+    nudgeState[k] = null;
+  }
+}
+
+/** 新任务/用户接管时重置催办状态 */
+function resetNudge(reason: string): void {
+  clearNudgeTimers();
+  nudgeState.attempts = 0;
+  nudgeState.awaitingReaction = false;
+  if (nudgeState.lastNudgeAt) wxLog(`催办状态重置（${reason}）`);
+  nudgeState.lastNudgeAt = 0;
+}
+
+/** 「agent 后边还有任务」：有排队消息 / 回复里写了后续计划 / 会话里有 goal 条目 */
+function hasFollowUpWork(ctx: ExtensionContext): boolean {
+  try {
+    if (ctx.hasPendingMessages()) return true;
+  } catch {
+    // ignore
+  }
+  const last = lastAssistantEntry(ctx);
+  if (
+    last &&
+    /(下一步|接下来|稍后|随后|待办|TODO|next step|next:|我会|计划)/i.test(last.text)
+  ) {
+    return true;
+  }
+  const entries = ctx.sessionManager.getBranch();
+  for (let i = entries.length - 1, seen = 0; i >= 0 && seen < 8; i -= 1, seen += 1) {
+    const custom = (entries[i] as { customType?: string }).customType;
+    if (custom && /goal/i.test(custom)) return true;
+  }
+  return false;
+}
+
+/** 落定后调用：满足条件则安排 NUDGE_DELAY_MS 后的催办检查 */
+async function armNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+  if (!rt || rt.stopped) return;
+  if (!loadNudgeEnabled()) return;
+  if (!nudgeState.taskFromWechat) return;
+  if (!nudgeState.replyDelivered) return;
+  if (!ctx.isIdle()) return;
+  if (nudgeState.attempts >= NUDGE_MAX_ATTEMPTS) {
+    wxLog(`不再催办：已催 ${nudgeState.attempts} 次`);
+    return;
+  }
+  if (!(await Promise.resolve(hasFollowUpWork(ctx)))) {
+    wxLog("不催办：回复未写后续任务，也没有排队消息/goal");
+    return;
+  }
+  if (nudgeState.timer) clearTimeout(nudgeState.timer);
+  nudgeState.timer = setTimeout(() => {
+    nudgeState.timer = null;
+    void fireNudge(ctx, pi);
+  }, NUDGE_DELAY_MS);
+  nudgeState.timer.unref?.();
+  wxLog(
+    `已安排催办：${fmtDuration(NUDGE_DELAY_MS)} 后若 agent 仍空闲则发「继续」（第 ${nudgeState.attempts + 1} 次）`,
+  );
+}
+
+async function fireNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+  if (!rt || rt.stopped) return;
+  if (!loadNudgeEnabled() || !nudgeState.taskFromWechat) return;
+  if (!ctx.isIdle()) {
+    wxLog("取消催办：agent 已在执行");
+    return;
+  }
+  if (nudgeState.attempts >= NUDGE_MAX_ATTEMPTS) return;
+
+  nudgeState.attempts += 1;
+  nudgeState.awaitingReaction = true;
+  nudgeState.replyDelivered = false;
+  nudgeState.lastNudgeAt = Date.now();
+  if (rt) {
+    // 让它的反应能直接推回微信
+    rt.pendingFromWechat = true;
+    rt.pendingSince = Date.now();
+  }
+  pi.sendUserMessage("继续");
+  wxLog(`已向 agent 发「继续」（第 ${nudgeState.attempts} 次，空闲超过 ${fmtDuration(NUDGE_DELAY_MS)}）`);
+
+  // 它一直不响应也要有个交待
+  if (nudgeState.reactionTimer) clearTimeout(nudgeState.reactionTimer);
+  nudgeState.reactionTimer = setTimeout(() => {
+    nudgeState.reactionTimer = null;
+    if (!nudgeState.awaitingReaction || !rt || rt.stopped) return;
+    nudgeState.awaitingReaction = false;
+    wxLog(`已发「继续」但 ${fmtDuration(NUDGE_REACTION_TIMEOUT_MS)} 内 agent 未响应`);
+    void pushToWechat(
+      `已发送「继续」，但 agent 在 ${fmtDuration(NUDGE_REACTION_TIMEOUT_MS)} 内没有响应，已停止催办。`,
+    );
+  }, NUDGE_REACTION_TIMEOUT_MS);
+  nudgeState.reactionTimer.unref?.();
+}
+
+/** agent 开始干活了（对「继续」有反应）：稍后把状态报告推回微信 */
+function onNudgeReaction(ctx: ExtensionContext, pi: ExtensionAPI): void {
+  if (!nudgeState.awaitingReaction) return;
+  nudgeState.awaitingReaction = false;
+  if (nudgeState.reactionTimer) {
+    clearTimeout(nudgeState.reactionTimer);
+    nudgeState.reactionTimer = null;
+  }
+  if (nudgeState.reportTimer) clearTimeout(nudgeState.reportTimer);
+  nudgeState.reportTimer = setTimeout(() => {
+    nudgeState.reportTimer = null;
+    void reportAfterNudge(ctx, pi);
+  }, NUDGE_REPORT_DELAY_MS);
+  nudgeState.reportTimer.unref?.();
+  wxLog(`agent 已响应「继续」，${fmtDuration(NUDGE_REPORT_DELAY_MS)} 后把状态报告推回微信`);
+}
+
+async function reportAfterNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+  if (!rt || rt.stopped) return;
+  const idle = ctx.isIdle();
+  const summary = idle
+    ? "agent 收到「继续」后仍回到空闲（未继续执行）。"
+    : await buildBusySummary(ctx);
+  await pushToWechat([`已自动发「继续」（第 ${nudgeState.attempts} 次）。`, summary].join("\n"));
+}
+
 async function handleInbound(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -797,10 +959,12 @@ async function handleInbound(
       await pushToWechat("空闲，没有在跑的任务，直接说要做什么就行。");
       return;
     }
+    resetNudge("打断");
     await interruptAndAskReport(pi, ctx);
     return;
   }
   if (text === "停止") {
+    resetNudge("停止");
     if (!ctx.isIdle()) {
       ctx.abort();
       await pushToWechat("已停止当前任务。");
@@ -833,6 +997,10 @@ async function handleInbound(
     rt.pendingFromWechat = true;
     rt.pendingSince = Date.now();
   }
+  // 「继续」催办：最近一条消息来自微信，重新开始计数
+  resetNudge("收到新的微信任务");
+  nudgeState.taskFromWechat = true;
+  nudgeState.replyDelivered = false;
   const serverLagS = msg.create_time_ms
     ? Math.round((Date.now() - msg.create_time_ms) / 1000)
     : -1;
@@ -911,6 +1079,7 @@ async function pushLatestAssistant(
     return "failed";
   }
   lastPushedEntryId = last.id;
+  nudgeState.replyDelivered = true;
   const textLag = last.ts ? Math.round((Date.now() - last.ts) / 1000) : -1;
   const taskLag = rt.pendingSince ? Math.round((Date.now() - rt.pendingSince) / 1000) : -1;
   wxLog(
@@ -1272,6 +1441,7 @@ export default function weixinAgent(pi: ExtensionAPI) {
   // 会话结束时清理长轮询资源
   pi.on("session_shutdown", async () => {
     clearEarlyPushTimer();
+    clearNudgeTimers();
     stopMonitor();
   });
 
@@ -1289,9 +1459,22 @@ export default function weixinAgent(pi: ExtensionAPI) {
   });
 
   // 执行状态观测（「状态」「打断」用）：只记录，不干预
-  pi.on("agent_start", async () => {
+  pi.on("agent_start", async (_event, ctx) => {
     activity.runStartedAt = Date.now();
     activity.current = null;
+    // 开始干活了：撤掉待发的催办；若刚发过「继续」，安排反应后的状态回报
+    if (nudgeState.timer) {
+      clearTimeout(nudgeState.timer);
+      nudgeState.timer = null;
+    }
+    onNudgeReaction(ctx, pi);
+  });
+
+  // 用户在终端直接输入 = 不再是纯粹的微信任务，停掉催办
+  pi.on("input", async (event) => {
+    if (event.source === "extension") return; // 扩展自己注入的（含微信任务/继续/打断）
+    nudgeState.taskFromWechat = false;
+    resetNudge(`终端输入（${event.source}）`);
   });
 
   pi.on("tool_execution_start", async (event) => {
@@ -1340,9 +1523,11 @@ export default function weixinAgent(pi: ExtensionAPI) {
     } catch (err) {
       wxLog(`结果推送失败: ${String(err)}`);
     }
+    // 已回复微信、但 agent 仍空闲且有后续任务 → 安排「继续」催办
+    await armNudge(ctx, pi);
   });
 
-  const WX_SUBCOMMANDS = ["status", "stop", "reconnect", "unbind", "widget", "debug", "help"];
+  const WX_SUBCOMMANDS = ["status", "stop", "reconnect", "unbind", "widget", "debug", "nudge", "help"];
 
   function wxHelp(ctx: ExtensionContext): void {
     const lines = [
@@ -1353,6 +1538,7 @@ export default function weixinAgent(pi: ExtensionAPI) {
       "/wx unbind           解绑并清除本地凭据",
       "/wx widget [on|off]  开关输入框上方的微信状态提示",
       "/wx debug [on|off]   后台日志是否输出到终端（默认关，日志文件始终写入）",
+      `/wx nudge [on|off]   微信任务回复后若 agent 空闲超过 ${fmtDuration(NUDGE_DELAY_MS)} 且有后续任务，是否自动发「继续」并回报状态`,
       "/wx help             显示本帮助",
     ];
     if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
@@ -1395,6 +1581,18 @@ export default function weixinAgent(pi: ExtensionAPI) {
         else console.log(`[weixin] ${msg}`);
         return;
       }
+      if (sub === "nudge" || sub.startsWith("nudge ")) {
+        const arg = sub.slice("nudge".length).trim();
+        const next = arg === "on" ? true : arg === "off" ? false : !loadNudgeEnabled();
+        writeSettings({ nudge: next });
+        if (!next) clearNudgeTimers();
+        const msg = next
+          ? `已开启「继续」催办（微信任务回复后空闲超过 ${fmtDuration(NUDGE_DELAY_MS)} 且还有后续任务时自动催）`
+          : "已关闭「继续」催办";
+        if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        else console.log(`[weixin] ${msg}`);
+        return;
+      }
       if (sub === "" || sub === "status") {
         if (sub === "status") {
           const creds = loadCredentials();
@@ -1417,6 +1615,7 @@ export default function weixinAgent(pi: ExtensionAPI) {
             `主动消息: 本窗口已发 ${rt?.sentSinceInbound ?? 0} 条${rt?.tokenAt ? `（token 年龄 ${Math.round((Date.now() - rt.tokenAt) / 1000)}s）` : ""}`,
             `pi 状态: ${ctx.isIdle() ? "空闲" : "正在执行任务"}`,
             `推送模式: ${loadSilent() ? "静默（仅微信任务回结果）" : "全部推送"}`,
+            `催办: ${loadNudgeEnabled() ? `开启（空闲 ${fmtDuration(NUDGE_DELAY_MS)} 触发，本任务已催 ${nudgeState.attempts} 次）` : "关闭"}`,
             `凭据目录: ${STATE_DIR}`,
             `日志文件: ${LOG_FILE}${loadDebugEnabled() ? "（终端调试输出已开启）" : ""}`,
           ];
