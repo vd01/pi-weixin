@@ -17,6 +17,7 @@ import {
 
 const REMIND_MS = 400;
 process.env.WEIXIN_IDLE_REMIND_MS = String(REMIND_MS);
+process.env.WEIXIN_IDLE_WATCHDOG_MS = "300";
 process.env.WEIXIN_EARLY_PUSH_MS = "200";
 
 const USER = "u1@im.wechat";
@@ -78,7 +79,7 @@ stub.state.inbox = [weixinInbound("继续", USER)];
 await sleep(600);
 check("人工「继续」才注入 agent", injected() === 1, JSON.stringify(host.outbound.map((o) => o[0].slice(0, 20))));
 check("「继续」带自检说明", /已无待办/.test(host.outbound.find(([t]) => t.startsWith("继续。（"))?.[0] ?? ""), "");
-check("人工「继续」有回执", /已让 agent 继续/.test(stub.last() ?? ""), stub.last());
+check("人工「继续」有回执", stub.sent.slice(-4).some((x) => /已让 agent 继续/.test(x)), JSON.stringify(stub.sent.slice(-4)));
 
 // ── 4) agent 忙时发「继续」→ 不注入、提示看状态
 host.flags.idle = false;
@@ -122,6 +123,27 @@ fs.writeFileSync(path.join(state, "settings.json"), JSON.stringify({ nudge: true
 stub.state.inbox = [weixinInbound("帮助", USER)];
 await sleep(600);
 check("帮助含「继续」说明", /继续：让空闲的 agent 接着干/.test(stub.last() ?? ""), stub.last());
+
+// ── 9) loop 指令触发的任务也会被提醒（此前只认“普通文本任务”，实测漏提醒）
+stub.state.inbox = [weixinInbound("loop", USER)];
+await sleep(400);
+const before9 = reminders().length;
+branchRef.value = [...branchRef.value, msgEntry("a-loop", "已按 research-loop 计划开始（进度：第 1 阶段）。预计 20 分钟。")];
+host.handlers.message_end[0]({ message: { role: "assistant", content: [{ type: "text", text: "已按 research-loop 计划开始（进度：第 1 阶段）。预计 20 分钟。" }] } }, ctx);
+host.flags.idle = true;
+await host.handlers.agent_settled[0]({}, ctx);
+await sleep(REMIND_MS + 400);
+check("loop 触发的任务也会收到空闲提醒", reminders().length === before9 + 1, JSON.stringify(stub.sent.slice(-2)));
+
+// ── 10) 错过 settle 也能靠巡检兜底：只更新活动时间，不发 settle
+const before10 = reminders().length;
+host.handlers.input[0]({ source: "extension", text: "x" }, ctx); // 不改状态
+stub.state.inbox = [weixinInbound("继续跑 D 腿", USER)];
+await sleep(350);
+branchRef.value = [...branchRef.value, msgEntry("a-D2", "D 腿进行中。接下来：等训练结束汇总。")];
+host.flags.idle = true; // 不调用 agent_settled
+await sleep(REMIND_MS + 900); // 等巡检（300ms 间隔）命中
+check("错过 settle 时巡检兜底提醒", reminders().length === before10 + 1, JSON.stringify(stub.sent.slice(-2)));
 
 check("终端保持安静", term.length === 0, JSON.stringify(term));
 

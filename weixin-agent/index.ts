@@ -594,6 +594,8 @@ function extractText(msg: WeixinMessage): string {
 type RecentAction = { tool: string; detail: string; startedAt: number; endedAt?: number; isError?: boolean };
 
 const activity = {
+  /** 最后一次“有事发生”的时刻（agent 活动或微信消息），用于空闲计时兜底 */
+  lastActivityAt: 0,
   runStartedAt: 0,
   current: null as null | { tool: string; detail: string; startedAt: number; toolCallId: string },
   recent: [] as RecentAction[],
@@ -761,6 +763,8 @@ const IDLE_REMIND_DELAY_MS =
 const idleState = {
   /** 最近一条用户消息来自微信 */
   taskFromWechat: false,
+  /** 该微信消息到达的时刻（空闲计时的起点之一） */
+  taskFromWechatAt: 0,
   /** 本次微信任务是否已提醒过（一个任务只提醒一次，节省主动消息额度） */
   reminded: false,
   timer: null as ReturnType<typeof setTimeout> | null,
@@ -824,11 +828,27 @@ function judgeFollowUp(ctx: ExtensionContext): { ok: boolean; why: string } {
 
 /** 落定后调用：满足条件则安排 IDLE_REMIND_DELAY_MS 后提醒人（不催 agent） */
 function armIdleReminder(ctx: ExtensionContext): void {
-  if (!rt || rt.stopped) return;
-  if (!loadIdleRemindEnabled()) return;
-  if (!idleState.taskFromWechat) return;
-  if (idleState.reminded) return;
-  if (!ctx.isIdle()) return;
+  // 注意：这里的每个早退都写日志，否则“为什么没提醒”无从排查（实测踩过）
+  if (!rt || rt.stopped) {
+    wxLog("空闲提醒未武装：微信通道未运行");
+    return;
+  }
+  if (!loadIdleRemindEnabled()) {
+    wxLog("空闲提醒未武装：开关已关闭（/wx nudge on 可开启）");
+    return;
+  }
+  if (!idleState.taskFromWechat) {
+    wxLog("空闲提醒未武装：最近一条消息不是微信下发（终端输入会重置）");
+    return;
+  }
+  if (idleState.reminded) {
+    wxLog("空闲提醒未武装：本任务已提醒过一次");
+    return;
+  }
+  if (!ctx.isIdle()) {
+    wxLog("空闲提醒未武装：落定时 agent 仍在执行");
+    return;
+  }
   const verdict = judgeFollowUp(ctx);
   if (!verdict.ok) {
     wxLog(`不发空闲提醒：${verdict.why}`);
@@ -902,6 +922,38 @@ async function startLoop(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void>
   wxLog(`微信下达 loop：${LOOP_SKILL}（${busy ? "排队 followUp" : "立即执行"}）`);
 }
 
+/**
+ * 空闲计时兜底巡检：settle 事件理论上足够，但一旦错过（例如 reload 时正好落定、
+ * 或某条早退分支挡住）就永远不会提醒。这里每 60s 检查一次“空闲是否真的超时”。
+ */
+let idleWatchdog: ReturnType<typeof setInterval> | null = null;
+
+function startIdleWatchdog(ctx: ExtensionContext): void {
+  stopIdleWatchdog();
+  idleWatchdog = setInterval(() => {
+    void checkIdleByWatchdog(ctx);
+  }, Number(process.env.WEIXIN_IDLE_WATCHDOG_MS ?? "") || 60_000);
+  idleWatchdog.unref?.();
+}
+
+function stopIdleWatchdog(): void {
+  if (idleWatchdog) clearInterval(idleWatchdog);
+  idleWatchdog = null;
+}
+
+async function checkIdleByWatchdog(ctx: ExtensionContext): Promise<void> {
+  if (!rt || rt.stopped) return;
+  if (!loadIdleRemindEnabled()) return;
+  if (!idleState.taskFromWechat || idleState.reminded) return;
+  if (!ctx.isIdle()) return;
+  const last = Math.max(activity.lastActivityAt, idleState.taskFromWechatAt);
+  if (last <= 0 || Date.now() - last < IDLE_REMIND_DELAY_MS) return;
+  const verdict = judgeFollowUp(ctx);
+  if (!verdict.ok) return;
+  wxLog(`空闲巡检命中：已空闲 ${fmtDuration(Date.now() - last)}（依据=${verdict.why}）`);
+  await sendIdleReminder(ctx, verdict.why);
+}
+
 /** 人在微信里发「继续」：这时才真正推动 agent */
 async function resumeFromWechat(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
   clearIdleTimer();
@@ -931,6 +983,11 @@ async function handleInbound(
   if (!from || msg.message_type !== 1) return;
   // 只处理绑定用户的私聊消息
   if (from !== rt?.creds.userId) return;
+  // 任何来自微信的消息都算“最近一条消息来自微信”（loop/继续/打断等指令也算），
+  // 否则指令触发的任务在空闲后不会被提醒（实测漏提醒就出在这里）
+  idleState.taskFromWechat = true;
+  idleState.taskFromWechatAt = Date.now();
+  activity.lastActivityAt = Date.now();
   // 去重（服务端可能重推）
   const msgId = String(msg.message_id ?? msg.seq ?? "");
   if (msgId) {
@@ -1043,6 +1100,8 @@ async function handleInbound(
   // 空闲提醒：最近一条消息来自微信，重新开始计数
   resetIdleState("收到新的微信任务");
   idleState.taskFromWechat = true;
+  idleState.taskFromWechatAt = Date.now();
+  activity.lastActivityAt = Date.now();
   const serverLagS = msg.create_time_ms
     ? Math.round((Date.now() - msg.create_time_ms) / 1000)
     : -1;
@@ -1476,6 +1535,8 @@ export default function weixinAgent(pi: ExtensionAPI) {
     }
     // 记住当前最后一条回复，避免重启/重载后把已发过的回复当成“本轮新结果”再推一次
     lastPushedEntryId = lastAssistantEntry(ctx)?.id ?? null;
+    activity.lastActivityAt = Date.now();
+    startIdleWatchdog(ctx);
     updateStatusWidget(ctx);
   });
 
@@ -1483,6 +1544,7 @@ export default function weixinAgent(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     clearEarlyPushTimer();
     clearIdleTimer();
+    stopIdleWatchdog();
     stopMonitor();
   });
 
@@ -1501,6 +1563,7 @@ export default function weixinAgent(pi: ExtensionAPI) {
 
   // 执行状态观测（「状态」「打断」用）：只记录，不干预
   pi.on("agent_start", async (_event, ctx) => {
+    activity.lastActivityAt = Date.now();
     activity.runStartedAt = Date.now();
     activity.current = null;
     // 开始干活了：撤掉待发的空闲提醒
@@ -1515,6 +1578,7 @@ export default function weixinAgent(pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_start", async (event) => {
+    activity.lastActivityAt = Date.now();
     if (!activity.runStartedAt) activity.runStartedAt = Date.now();
     const startedAt = Date.now();
     const detail = toolDetail(event.toolName, event.args);
@@ -1539,6 +1603,8 @@ export default function weixinAgent(pi: ExtensionAPI) {
     activity.current = null;
     activity.runStartedAt = 0;
     clearEarlyPushTimer();
+    // 空闲提醒与「静默模式」无关（静默只影响结果推送），必须在早退之前武装
+    armIdleReminder(ctx);
     const pending = rt.pendingFromWechat;
     // 静默模式下只回微信下发的任务
     if (!pending && loadSilent()) return;
@@ -1560,8 +1626,6 @@ export default function weixinAgent(pi: ExtensionAPI) {
     } catch (err) {
       wxLog(`结果推送失败: ${String(err)}`);
     }
-    // 已回复微信、但 agent 仍空闲且有后续任务 → 空闲到点提醒人（决定权在微信侧）
-    armIdleReminder(ctx);
   });
 
   const WX_SUBCOMMANDS = ["status", "stop", "reconnect", "unbind", "widget", "debug", "nudge", "help"];
