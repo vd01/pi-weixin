@@ -94,10 +94,13 @@ export function makeHost({ branchRef, userId, home, onSendUserMessage }) {
   const aborts = { count: 0 };
   const flags = { idle: true };
   const commands = {};
+  /** 可变的“已加载命令”列表（含 skill:*），供 loop 判断 skill 是否存在 */
+  const availableCommands = [{ name: "skill:research-loop", description: "research loop" }];
   const fakePi = {
     on: (n, f) => ((handlers[n] ??= []).push(f)),
     registerCommand: (n, d) => (commands[n] = d),
     getSessionName: () => "sess",
+    getCommands: () => availableCommands,
     sendUserMessage: (t, o) => {
       outbound.push([t, o]);
       onSendUserMessage?.(t, o);
@@ -117,7 +120,7 @@ export function makeHost({ branchRef, userId, home, onSendUserMessage }) {
     ui: { notify: () => {}, setWidget: () => {}, custom: async () => ({}) },
     sessionManager: { getBranch: () => branchRef.value },
   };
-  return { handlers, outbound, aborts, flags, fakePi, fakeCtx, commands };
+  return { handlers, outbound, aborts, flags, fakePi, fakeCtx, commands, availableCommands };
 }
 
 export const msgEntry = (id, text, extra = {}) => ({

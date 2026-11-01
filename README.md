@@ -25,6 +25,7 @@
   | `状态` | agent 空闲时只回「空闲」；执行中**不打断**，返回：正在执行的任务 / 当前动作与耗时 / 最近几步 / 后续计划 + CPU·内存·GPU |
   | `打断` | 终止当前执行，并让 agent **先汇报现状与后续计划**，之后进入正常对话 |
   | `继续` | 让空闲的 agent 接着干（收到空闲提醒后由你决定；扩展不会自动催） |
+  | `loop` | 下发 `research-loop` skill，并附「按预定计划执行，中途不要因为上下文紧张等原因停下来」——按计划持续跑 |
   | `停止` | 只中断当前任务（不要求汇报） |
   | `静默` | 切换推送模式（开启后仅微信下发的任务回结果） |
   | `解绑` | 解除绑定并清除本地凭据 |
@@ -88,7 +89,7 @@ cp -r weixin-agent ~/.pi/agent/extensions/
 隔离测试（不联网、不碰真实微信账号与状态：临时 `HOME` + 本地 stub iLink 服务，跑真实扩展代码）：
 
 ```bash
-bash weixin-agent/tests/run-all.sh   # 5 套 / 83 项断言
+bash weixin-agent/tests/run-all.sh   # 5 套 / 92 项断言
 ```
 
 | 套件 | 覆盖 |
@@ -96,7 +97,7 @@ bash weixin-agent/tests/run-all.sh   # 5 套 / 83 项断言
 | `suite-logs` | 后台日志只落盘（终端零噪音）、`/wx status`、`/wx debug` |
 | `suite-dedup` | 结果推送去重、失败重试、重载后不重推 |
 | `suite-earlypush` | 微信任务早推、非微信任务仅落定推、静默模式、延迟日志 |
-| `suite-status-interrupt` | `状态`（空闲/执行中）、`打断`（abort + 快照汇报）、帮助文案 |
+| `suite-status-interrupt` | `状态`（空闲/执行中）、`打断`（abort + 快照汇报）、`loop`（skill 展开/排队/skill 缺失）、帮助文案 |
 | `suite-idle-reminder` | 空闲提醒（只提醒不催）、黑名单判定、人回「继续」才推动、忙时不注入、开关与帮助文案 |
 
 ## 文件位置

@@ -864,6 +864,44 @@ async function sendIdleReminder(ctx: ExtensionContext, why: string): Promise<voi
   wxLog(`空闲提醒推送${ok ? "成功" : "失败"}`);
 }
 
+/** 微信「loop」：下发 research-loop skill，并附「按计划执行、不因上下文紧张停下」的提示 */
+const LOOP_SKILL = "research-loop";
+const LOOP_HINT = "按照预定计划执行，中途不要因为上下文紧张等原因停下来。";
+
+async function startLoop(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+  let hasSkill = false;
+  try {
+    hasSkill = pi.getCommands().some((c) => c.name === `skill:${LOOP_SKILL}`);
+  } catch {
+    hasSkill = false;
+  }
+  if (!hasSkill) {
+    await pushToWechat(
+      `未找到 skill「${LOOP_SKILL}」，请确认 ~/.pi/agent/skills/${LOOP_SKILL}/SKILL.md 存在（或该 skill 未被加载）。`,
+    );
+    wxLog(`loop 失败：未找到 skill:${LOOP_SKILL}`);
+    return;
+  }
+
+  const busy = !ctx.isIdle();
+  resetIdleState("loop");
+  if (rt) {
+    rt.pendingFromWechat = true;
+    rt.pendingSince = Date.now();
+  }
+  // 注意：必须 expandPromptTemplates=true，否则 /skill:xxx 不会被展开成 SKILL.md 内容
+  pi.sendUserMessage(`/skill:${LOOP_SKILL} ${LOOP_HINT}`, {
+    expandPromptTemplates: true,
+    ...(busy ? { deliverAs: "followUp" as const } : {}),
+  });
+  await pushToWechat(
+    busy
+      ? `agent 正在执行，已排队：${LOOP_SKILL}（当前这轮结束后按计划持续执行）`
+      : `已下发 ${LOOP_SKILL}：按预定计划执行，不因上下文紧张等因素中途停下。`,
+  );
+  wxLog(`微信下达 loop：${LOOP_SKILL}（${busy ? "排队 followUp" : "立即执行"}）`);
+}
+
 /** 人在微信里发「继续」：这时才真正推动 agent */
 async function resumeFromWechat(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
   clearIdleTimer();
@@ -932,6 +970,7 @@ async function handleInbound(
         "- 直接发送任意文本：作为任务下发给 pi，完成后自动推送最终结果",
         "- 状态：空闲时只回“空闲”；执行中不打断，返回任务/当前动作/计划 + CPU/GPU",
         "- 继续：让空闲的 agent 接着干（收到空闲提醒后再发；扩展不会自动催）",
+        "- loop：下发 research-loop skill，按预定计划持续执行（不因上下文紧张停下）",
         "- 打断：终止当前执行，让它先汇报现状与后续计划，之后进入正常对话",
         "- 停止：仅中断当前任务（不要求汇报）",
         "- 静默：切换结果推送模式（开启后仅微信下发的任务回结果）",
@@ -956,6 +995,10 @@ async function handleInbound(
     }
     resetIdleState("打断");
     await interruptAndAskReport(pi, ctx);
+    return;
+  }
+  if (text === "loop" || text === "LOOP" || text === "Loop") {
+    await startLoop(pi, ctx);
     return;
   }
   if (text === "继续" || text === "继续吧") {

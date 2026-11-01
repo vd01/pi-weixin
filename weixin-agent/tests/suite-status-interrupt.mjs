@@ -103,11 +103,39 @@ await ask("打断");
 check("空闲打断不 abort", host.aborts.count === before, String(host.aborts.count));
 check("空闲打断提示空闲", /空闲/.test(stub.last()), stub.last());
 
+// 6.5) loop：下发 research-loop skill + 「按计划执行、不因上下文紧张停下」提示
+host.outbound.length = 0;
+host.flags.idle = true;
+await ask("loop");
+const loopMsg = host.outbound.find(([t]) => t.startsWith("/skill:"));
+check("loop 注入 skill:research-loop", Boolean(loopMsg) && loopMsg[0].startsWith("/skill:research-loop"), JSON.stringify(host.outbound.map((o) => o[0].slice(0, 40))));
+check("loop 带“按计划执行”提示", /按照预定计划执行，中途不要因为上下文紧张等原因停下来/.test(loopMsg?.[0] ?? ""), loopMsg?.[0]);
+check("loop 启用 skill 展开", loopMsg?.[1]?.expandPromptTemplates === true, JSON.stringify(loopMsg?.[1]));
+check("loop 有回执", /已下发 research-loop/.test(stub.last() ?? ""), stub.last());
+
+// agent 忙时 loop → 排队 followUp
+host.flags.idle = false;
+host.outbound.length = 0;
+await ask("loop");
+const queued = host.outbound.find(([t]) => t.startsWith("/skill:"));
+check("忙时 loop 排队 followUp", queued?.[1]?.deliverAs === "followUp", JSON.stringify(queued?.[1]));
+check("忙时 loop 回执说明排队", /正在执行，已排队/.test(stub.last() ?? ""), stub.last());
+host.flags.idle = true;
+
+// skill 不存在 → 不注入、给出原因
+host.availableCommands.length = 0;
+host.outbound.length = 0;
+await ask("loop");
+check("skill 缺失时不注入", host.outbound.length === 0, JSON.stringify(host.outbound));
+check("skill 缺失时说明原因", /未找到 skill「research-loop」/.test(stub.last() ?? ""), stub.last());
+host.availableCommands.push({ name: "skill:research-loop", description: "research loop" });
+
 // 7) 帮助列出两条新指令
 await ask("帮助");
 const help = stub.last();
 check("帮助含状态说明", /状态：.*不打断/.test(help), "");
 check("帮助含打断说明", /打断：终止当前执行.*汇报/.test(help), "");
+check("帮助含 loop 说明", /loop：下发 research-loop skill/.test(help), "");
 
 check("终端保持安静", term.length === 0, JSON.stringify(term));
 
