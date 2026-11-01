@@ -783,49 +783,6 @@ function resetIdleState(reason: string): void {
   if (had) wxLog(`空闲提醒状态重置（${reason}）`);
 }
 
-/**
- * 「是否还有后续任务」判断。
- *
- * 只用**黑名单**：清楚表明“已无待办 / 在等你决策 / 无需处理”才不提醒，
- * 其余一律提醒（早前用关键词白名单，agent 换成「进度/ETA/我继续盯」文风就漏判过）。
- */
-const IDLE_SKIP_RULES: Array<{ re: RegExp; why: string }> = [
-  { re: /(等你(确认|回复|决定|拍板)|等您(确认|决定)|请您?(确认|决定)|需要你(确认|决定|拍板))/, why: "回复在等你决策" },
-  { re: /(已无待办|没有待办|无待办|已全部完成|全部完成|已全部跑完|已全部结束|任务已全部结束)/, why: "回复表示已无待办" },
-  { re: /(一切正常|没有报错|无异常|没有问题|不需要处理|无需处理)/, why: "回复表示无需处理" },
-];
-
-/** 仅用于日志：说明为什么决定提醒 */
-function followUpSignals(ctx: ExtensionContext): string[] {
-  const signals: string[] = [];
-  try {
-    if (ctx.hasPendingMessages()) signals.push("有排队消息");
-  } catch {
-    // ignore
-  }
-  const text = lastAssistantEntry(ctx)?.text ?? "";
-  if (/(下一步|接下来|稍后|随后|计划|待办|TODO)/i.test(text)) signals.push("回复含计划用语");
-  if (/(进度|ETA|预计|等待|等 s\d|后台|setsid|继续盯)/i.test(text)) signals.push("回复含进度/等待用语");
-  const entries = ctx.sessionManager.getBranch();
-  for (let i = entries.length - 1, seen = 0; i >= 0 && seen < 8; i -= 1, seen += 1) {
-    const custom = (entries[i] as { customType?: string }).customType;
-    if (custom && /goal/i.test(custom)) {
-      signals.push("goal 续跑中");
-      break;
-    }
-  }
-  return signals;
-}
-
-function judgeFollowUp(ctx: ExtensionContext): { ok: boolean; why: string } {
-  const text = lastAssistantEntry(ctx)?.text ?? "";
-  for (const rule of IDLE_SKIP_RULES) {
-    if (rule.re.test(text)) return { ok: false, why: rule.why };
-  }
-  const signals = followUpSignals(ctx);
-  return { ok: true, why: signals.length > 0 ? signals.join("、") : "无明确的完成/等待标记" };
-}
-
 /** 落定后调用：满足条件则安排 IDLE_REMIND_DELAY_MS 后提醒人（不催 agent） */
 function armIdleReminder(ctx: ExtensionContext): void {
   // 注意：这里的每个早退都写日志，否则“为什么没提醒”无从排查（实测踩过）
@@ -849,24 +806,19 @@ function armIdleReminder(ctx: ExtensionContext): void {
     wxLog("空闲提醒未武装：落定时 agent 仍在执行");
     return;
   }
-  const verdict = judgeFollowUp(ctx);
-  if (!verdict.ok) {
-    wxLog(`不发空闲提醒：${verdict.why}`);
-    return;
-  }
   clearIdleTimer();
   idleState.timer = setTimeout(() => {
     idleState.timer = null;
-    void sendIdleReminder(ctx, verdict.why);
+    void sendIdleReminder(ctx);
   }, IDLE_REMIND_DELAY_MS);
   idleState.timer.unref?.();
   wxLog(
-    `已安排空闲提醒：${fmtDuration(IDLE_REMIND_DELAY_MS)} 后若仍空闲则提醒微信侧人工决定（依据=${verdict.why}）`,
+    `已安排空闲提醒：${fmtDuration(IDLE_REMIND_DELAY_MS)} 后若仍空闲则提醒微信侧（是否有后续任务由人判断）`,
   );
 }
 
-/** 空闲到点：只发提醒，不向 agent 注入任何内容 */
-async function sendIdleReminder(ctx: ExtensionContext, why: string): Promise<void> {
+/** 空闲到点：只发提醒，不向 agent 注入任何内容，也不判断是否还有后续任务（交给人判断） */
+async function sendIdleReminder(ctx: ExtensionContext): Promise<void> {
   if (!rt || rt.stopped) return;
   if (!loadIdleRemindEnabled() || !idleState.taskFromWechat || idleState.reminded) return;
   if (!ctx.isIdle()) {
@@ -876,7 +828,7 @@ async function sendIdleReminder(ctx: ExtensionContext, why: string): Promise<voi
   idleState.reminded = true;
   const ok = await pushToWechat(
     [
-      `agent 已空闲 ${fmtDuration(IDLE_REMIND_DELAY_MS)}，看起来还有没做完的活（依据：${why}）。`,
+      `agent 已空闲 ${fmtDuration(IDLE_REMIND_DELAY_MS)}。`,
       "回复「继续」让它接着干；发「状态」看它在做什么；不用了忽略本条即可。",
     ].join("\n"),
     { label: "空闲提醒" },
@@ -948,10 +900,8 @@ async function checkIdleByWatchdog(ctx: ExtensionContext): Promise<void> {
   if (!ctx.isIdle()) return;
   const last = Math.max(activity.lastActivityAt, idleState.taskFromWechatAt);
   if (last <= 0 || Date.now() - last < IDLE_REMIND_DELAY_MS) return;
-  const verdict = judgeFollowUp(ctx);
-  if (!verdict.ok) return;
-  wxLog(`空闲巡检命中：已空闲 ${fmtDuration(Date.now() - last)}（依据=${verdict.why}）`);
-  await sendIdleReminder(ctx, verdict.why);
+  wxLog(`空闲巡检命中：已空闲 ${fmtDuration(Date.now() - last)}，提醒微信侧人工判断`);
+  await sendIdleReminder(ctx);
 }
 
 /** 人在微信里发「继续」：这时才真正推动 agent */

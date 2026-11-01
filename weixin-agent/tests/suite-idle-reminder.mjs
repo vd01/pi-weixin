@@ -63,8 +63,8 @@ await wechatTurn(
 check("到点只提醒、不自动催 agent", injected() === 0, JSON.stringify(host.outbound.map((o) => o[0].slice(0, 20))));
 const r1 = stub.sent.slice(before1).filter((s) => /agent 已空闲/.test(s));
 check("提醒已推到微信", r1.length === 1, JSON.stringify(stub.sent.slice(before1)));
-check("提醒说明了依据", /依据：回复含进度\/等待用语/.test(r1[0] ?? ""), r1[0]);
 check("提醒告诉人回「继续」", /回复「继续」/.test(r1[0] ?? ""), r1[0]);
+check("提醒不再做任务判定", !/依据|看起来还有/.test(r1[0] ?? ""), r1[0]);
 check("提醒留痕", /空闲提醒推送成功/.test(logText()), "");
 
 // ── 2) 一个任务只提醒一次
@@ -90,16 +90,12 @@ check("忙时不注入「继续」", injected() === 0, JSON.stringify(host.outbo
 check("忙时提示不需要继续", /正在执行，不需要「继续」/.test(stub.last() ?? ""), stub.last());
 host.flags.idle = true;
 
-// ── 5) 明确“已无待办/等你决策/无需处理”→ 不提醒
-for (const [reply, why] of [
-  ["全部完成，已无待办。", "已无待办"],
-  ["等你确认方案：选 A 还是 B？", "等你决策"],
-  ["日志没有报错，一切正常。", "无需处理"],
-]) {
+// ── 5) 不做任务判定：哪怕回复“已无待办/一切正常”，也照样提醒，由人决定
+for (const reply of ["全部完成，已无待办。", "等你确认方案：选 A 还是 B？", "日志没有报错，一切正常。"]) {
   const before = reminders().length;
   const beforeInject = injected();
-  await wechatTurn(`检查项 ${why}`, reply);
-  check(`不提醒：${why}`, reminders().length === before && injected() === beforeInject, "");
+  await wechatTurn(`检查项 ${reply.slice(0, 6)}`, reply);
+  check(`照常提醒（不判定）：${reply.slice(0, 8)}`, reminders().length === before + 1 && injected() === beforeInject, "");
 }
 
 // ── 6) 终端输入的任务不提醒
