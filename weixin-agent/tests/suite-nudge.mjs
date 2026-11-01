@@ -38,7 +38,8 @@ await host.handlers.session_start[0]({}, ctx);
 await sleep(150);
 
 const logText = () => fs.readFileSync(path.join(state, "weixin.log"), "utf-8");
-const nudges = () => host.outbound.filter(([t]) => t === "继续").length;
+// 只数「催办」本身（任务文本也可能以“继续”开头）
+const nudges = () => host.outbound.filter(([t]) => t.startsWith("继续。（")).length;
 
 /** 一轮：微信发任务 → agent 出回复 → 落定 → 等催办窗口 */
 const wechatTurn = async (task, reply, { idleAfter = true, expectPush = true } = {}) => {
@@ -93,6 +94,32 @@ await host.handlers.agent_settled[0]({}, ctx);
 stub.state.failNext = false;
 await sleep(NUDGE_MS + 300);
 check("推送失败也照样催办", nudges() === 1, JSON.stringify(host.outbound.map((o) => o[0].slice(0, 12))));
+
+// ── 3.5) 真实漏催场景：回复是“进度/ETA”文风，不含旧关键词，但确实还有活 → 必须催
+host.outbound.length = 0;
+await wechatTurn(
+  "看下 Z3 进展",
+  [
+    "**进度（13:12）**",
+    "| 主臂 s13 | 训练刚完成，12 s 面板评测进行中（~2 min） |",
+    "| 后台收尾 | 已挂 setsid 脚本：等 s13 评测完 → 自动跑 5 min 分片 → 写日志 |",
+    "| ETA | 全部数据齐 ≈ 13:50 |",
+    "数据一齐我就算三 seed 配对，现在无需任何操作，我继续盯。",
+  ].join("\n"),
+);
+check("进度/ETA 文风也会催（修复漏催）", nudges() === 1, JSON.stringify(host.outbound.map((o) => o[0].slice(0, 16))));
+
+// 被排除的三种情形
+const noNudge = [
+  ["等你确认方案：选 A 还是 B？", "回复在等你决策"],
+  ["全部完成，已无待办。", "回复表示已无待办"],
+  ["日志没有报错，一切正常。", "回复表示无需处理"],
+];
+for (const [reply, why] of noNudge) {
+  host.outbound.length = 0;
+  await wechatTurn(`检查项 ${why}`, reply);
+  check(`不催：${why}`, nudges() === 0, JSON.stringify(host.outbound));
+}
 
 // ── 4) 回复里没有后续任务 → 不催
 host.outbound.length = 0;

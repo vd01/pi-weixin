@@ -803,26 +803,53 @@ function resetNudge(reason: string): void {
   nudgeState.lastNudgeAt = 0;
 }
 
-/** 「agent 后边还有任务」：有排队消息 / 回复里写了后续计划 / 会话里有 goal 条目 */
-function hasFollowUpWork(ctx: ExtensionContext): boolean {
+/**
+ * 「是否还有后续任务」判断。
+ *
+ * 实测教训：早前靠关键词白名单（下一步/接下来/计划…）判断，agent 换成
+ * “进度（13:12）/ETA ≈13:50/数据一齐我就算/我继续盯” 这种写法就完全匹配不上，
+ * 导致明明还有活却不催（2026-11-01 05:12 日志：不催办：回复未写后续任务…）。
+ *
+ * 现在改为**黑名单式**：清楚表明“已无待办 / 在等你决策 / 无需处理”才不催，
+ * 其余一律催（催错一次只多一轮对话；漏催则是 agent 停着等，代价更大）。
+ */
+const NUDGE_SKIP_RULES: Array<{ re: RegExp; why: string }> = [
+  { re: /(等你(确认|回复|决定|拍板)|等您(确认|决定)|请您?(确认|决定)|需要你(确认|决定|拍板))/, why: "回复在等你决策" },
+  { re: /(已无待办|没有待办|无待办|已全部完成|全部完成|已全部跑完|已全部结束|任务已全部结束)/, why: "回复表示已无待办" },
+  { re: /(一切正常|没有报错|无异常|没有问题|不需要处理|无需处理)/, why: "回复表示无需处理" },
+];
+
+/** 仅用于日志：说明为什么决定催 */
+function followUpSignals(ctx: ExtensionContext): string[] {
+  const signals: string[] = [];
   try {
-    if (ctx.hasPendingMessages()) return true;
+    if (ctx.hasPendingMessages()) signals.push("有排队消息");
   } catch {
     // ignore
   }
   const last = lastAssistantEntry(ctx);
-  if (
-    last &&
-    /(下一步|接下来|稍后|随后|待办|TODO|next step|next:|我会|计划)/i.test(last.text)
-  ) {
-    return true;
-  }
+  const text = last?.text ?? "";
+  if (/(下一步|接下来|稍后|随后|计划|待办|TODO)/i.test(text)) signals.push("回复含计划用语");
+  if (/(进度|ETA|预计|等待|等 s\d|后台|setsid|继续盯)/i.test(text)) signals.push("回复含进度/等待用语");
   const entries = ctx.sessionManager.getBranch();
   for (let i = entries.length - 1, seen = 0; i >= 0 && seen < 8; i -= 1, seen += 1) {
     const custom = (entries[i] as { customType?: string }).customType;
-    if (custom && /goal/i.test(custom)) return true;
+    if (custom && /goal/i.test(custom)) {
+      signals.push("goal 续跑中");
+      break;
+    }
   }
-  return false;
+  return signals;
+}
+
+/** 判定是否催办；why 用于日志留痕 */
+function judgeFollowUp(ctx: ExtensionContext): { ok: boolean; why: string } {
+  const text = lastAssistantEntry(ctx)?.text ?? "";
+  for (const rule of NUDGE_SKIP_RULES) {
+    if (rule.re.test(text)) return { ok: false, why: rule.why };
+  }
+  const signals = followUpSignals(ctx);
+  return { ok: true, why: signals.length > 0 ? signals.join("、") : "无明确的完成/等待标记，默认催" };
 }
 
 /** 落定后调用：满足条件则安排 NUDGE_DELAY_MS 后的催办检查 */
@@ -835,8 +862,9 @@ async function armNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> 
     wxLog(`不再催办：已催 ${nudgeState.attempts} 次`);
     return;
   }
-  if (!(await Promise.resolve(hasFollowUpWork(ctx)))) {
-    wxLog("不催办：回复未写后续任务，也没有排队消息/goal");
+  const verdict = judgeFollowUp(ctx);
+  if (!verdict.ok) {
+    wxLog(`不催办：${verdict.why}`);
     return;
   }
   if (nudgeState.timer) clearTimeout(nudgeState.timer);
@@ -846,7 +874,7 @@ async function armNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> 
   }, NUDGE_DELAY_MS);
   nudgeState.timer.unref?.();
   wxLog(
-    `已安排催办：${fmtDuration(NUDGE_DELAY_MS)} 后若 agent 仍空闲则发「继续」（第 ${nudgeState.attempts + 1} 次）`,
+    `已安排催办：${fmtDuration(NUDGE_DELAY_MS)} 后若 agent 仍空闲则发「继续」（第 ${nudgeState.attempts + 1} 次；依据=${verdict.why}）`,
   );
 }
 
@@ -868,7 +896,9 @@ async function fireNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void>
     rt.pendingFromWechat = true;
     rt.pendingSince = Date.now();
   }
-  pi.sendUserMessage("继续");
+  pi.sendUserMessage(
+    "继续。（若有未完成的工作就直接继续，不要重复汇报；若确实已无待办或需要我决定，只回一句「已无待办」或「需要你决定：…」）",
+  );
   wxLog(`已向 agent 发「继续」（第 ${nudgeState.attempts} 次，空闲超过 ${fmtDuration(NUDGE_DELAY_MS)}）`);
 
   // 它一直不响应也要有个交待
