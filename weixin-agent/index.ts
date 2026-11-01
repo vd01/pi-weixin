@@ -743,7 +743,6 @@ async function interruptAndAskReport(pi: ExtensionAPI, ctx: ExtensionContext): P
 // ---------------------------------------------------------------------------
 
 const NUDGE_DELAY_MS = Number(process.env.WEIXIN_NUDGE_MS ?? "") || 3 * 60_000;
-const NUDGE_REPORT_DELAY_MS = Number(process.env.WEIXIN_NUDGE_REPORT_MS ?? "") || 20_000;
 const NUDGE_REACTION_TIMEOUT_MS =
   Number(process.env.WEIXIN_NUDGE_REACTION_TIMEOUT_MS ?? "") || 5 * 60_000;
 const NUDGE_MAX_ATTEMPTS = Number(process.env.WEIXIN_NUDGE_MAX ?? "") || 2;
@@ -751,20 +750,20 @@ const NUDGE_MAX_ATTEMPTS = Number(process.env.WEIXIN_NUDGE_MAX ?? "") || 2;
 const nudgeState = {
   /** 最近一条用户消息来自微信 */
   taskFromWechat: false,
-  /** 该任务已成功把回复推到微信（“agent 回复了微信消息”成立） */
-  replyDelivered: false,
   /** 已发出的「继续」次数 */
   attempts: 0,
   /** 已发「继续」，等 agent 反应 */
   awaitingReaction: false,
+  /** agent 已开始响应「继续」，但它的回复还没推出去（状态要合并进那条回复） */
+  reactionPending: false,
   timer: null as ReturnType<typeof setTimeout> | null,
-  reportTimer: null as ReturnType<typeof setTimeout> | null,
+  fallbackTimer: null as ReturnType<typeof setTimeout> | null,
   reactionTimer: null as ReturnType<typeof setTimeout> | null,
   lastNudgeAt: 0,
 };
 
 function clearNudgeTimers(): void {
-  for (const k of ["timer", "reportTimer", "reactionTimer"] as const) {
+  for (const k of ["timer", "fallbackTimer", "reactionTimer"] as const) {
     const t = nudgeState[k];
     if (t) clearTimeout(t);
     nudgeState[k] = null;
@@ -807,7 +806,6 @@ async function armNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> 
   if (!rt || rt.stopped) return;
   if (!loadNudgeEnabled()) return;
   if (!nudgeState.taskFromWechat) return;
-  if (!nudgeState.replyDelivered) return;
   if (!ctx.isIdle()) return;
   if (nudgeState.attempts >= NUDGE_MAX_ATTEMPTS) {
     wxLog(`不再催办：已催 ${nudgeState.attempts} 次`);
@@ -839,7 +837,7 @@ async function fireNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void>
 
   nudgeState.attempts += 1;
   nudgeState.awaitingReaction = true;
-  nudgeState.replyDelivered = false;
+  nudgeState.reactionPending = false;
   nudgeState.lastNudgeAt = Date.now();
   if (rt) {
     // 让它的反应能直接推回微信
@@ -863,30 +861,52 @@ async function fireNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void>
   nudgeState.reactionTimer.unref?.();
 }
 
-/** agent 开始干活了（对「继续」有反应）：稍后把状态报告推回微信 */
+/** agent 开始干活了（对「继续」有反应）：把状态降级为「合并到它的下一条回复」 */
 function onNudgeReaction(ctx: ExtensionContext, pi: ExtensionAPI): void {
   if (!nudgeState.awaitingReaction) return;
   nudgeState.awaitingReaction = false;
+  nudgeState.reactionPending = true;
   if (nudgeState.reactionTimer) {
     clearTimeout(nudgeState.reactionTimer);
     nudgeState.reactionTimer = null;
   }
-  if (nudgeState.reportTimer) clearTimeout(nudgeState.reportTimer);
-  nudgeState.reportTimer = setTimeout(() => {
-    nudgeState.reportTimer = null;
-    void reportAfterNudge(ctx, pi);
-  }, NUDGE_REPORT_DELAY_MS);
-  nudgeState.reportTimer.unref?.();
-  wxLog(`agent 已响应「继续」，${fmtDuration(NUDGE_REPORT_DELAY_MS)} 后把状态报告推回微信`);
+  // 它已经开始跑，但可能一直没有文本回复（只调工具）：兜底推一条简短状态，避免完全静默
+  if (nudgeState.fallbackTimer) clearTimeout(nudgeState.fallbackTimer);
+  nudgeState.fallbackTimer = setTimeout(async () => {
+    nudgeState.fallbackTimer = null;
+    if (!nudgeState.reactionPending || !rt || rt.stopped) return;
+    nudgeState.reactionPending = false;
+    wxLog(`agent 已响应「继续」但 ${fmtDuration(NUDGE_REACTION_TIMEOUT_MS)} 内无文本回复，兜底推一条状态`);
+    const suffix = await statusSuffixLines(ctx);
+    await pushToWechat(
+      [`已发「继续」（第 ${nudgeState.attempts} 次），agent 已继续执行但暂无文本回复。`].concat(suffix).join("\n"),
+    );
+  }, NUDGE_REACTION_TIMEOUT_MS);
+  nudgeState.fallbackTimer.unref?.();
+  wxLog(`agent 已响应「继续」，状态将合并进它的下一条回复`);
 }
 
-async function reportAfterNudge(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
-  if (!rt || rt.stopped) return;
-  const idle = ctx.isIdle();
-  const summary = idle
-    ? "agent 收到「继续」后仍回到空闲（未继续执行）。"
-    : await buildBusySummary(ctx);
-  await pushToWechat([`已自动发「继续」（第 ${nudgeState.attempts} 次）。`, summary].join("\n"));
+/** 紧凑状态行（合并进 agent 回复用，最多 3 行，不吃额外额度） */
+async function statusSuffixLines(ctx: ExtensionContext): Promise<string[]> {
+  const lines: string[] = [];
+  const runMs = activity.runStartedAt ? Date.now() - activity.runStartedAt : 0;
+  lines.push(`[状态] ${ctx.isIdle() ? "空闲" : `执行中（已 ${fmtDuration(runMs)}）`}`);
+  if (activity.current) {
+    const detail = activity.current.detail ? ` · ${clip(activity.current.detail, 50)}` : "";
+    lines.push(
+      `[当前] ${activity.current.tool}${detail}（已 ${fmtDuration(Date.now() - activity.current.startedAt)}）`,
+    );
+  }
+  try {
+    const sys = await collectSysInfo();
+    const compact = [sys[0], sys[1], sys.find((l) => l.startsWith("GPU"))]
+      .filter((l): l is string => Boolean(l))
+      .join(" | ");
+    if (compact) lines.push(`[资源] ${compact}`);
+  } catch {
+    // 采集失败就不带资源行
+  }
+  return lines;
 }
 
 async function handleInbound(
@@ -1000,7 +1020,6 @@ async function handleInbound(
   // 「继续」催办：最近一条消息来自微信，重新开始计数
   resetNudge("收到新的微信任务");
   nudgeState.taskFromWechat = true;
-  nudgeState.replyDelivered = false;
   const serverLagS = msg.create_time_ms
     ? Math.round((Date.now() - msg.create_time_ms) / 1000)
     : -1;
@@ -1073,17 +1092,30 @@ async function pushLatestAssistant(
     return "skipped";
   }
   const label = pi.getSessionName() || path.basename(ctx.cwd);
-  const ok = await pushToWechat(last.text, { prefix: `[${label}] ` });
+  // 若这条是「继续」后的反应，把状态报告合并进同一条消息（不额外发消息、不吃额度）
+  let body = last.text;
+  const mergeStatus = nudgeState.reactionPending;
+  if (mergeStatus) {
+    const suffix = await statusSuffixLines(ctx);
+    if (suffix.length > 0) body = `${last.text}\n\n————\n${suffix.join("\n")}`;
+  }
+  const ok = await pushToWechat(body, { prefix: `[${label}] ` });
   if (!ok) {
     wxLog(`推送未成功（来源=${reason}），条目 ${last.id} 保留待重试`);
     return "failed";
   }
   lastPushedEntryId = last.id;
-  nudgeState.replyDelivered = true;
+  if (mergeStatus) {
+    nudgeState.reactionPending = false;
+    if (nudgeState.fallbackTimer) {
+      clearTimeout(nudgeState.fallbackTimer);
+      nudgeState.fallbackTimer = null;
+    }
+  }
   const textLag = last.ts ? Math.round((Date.now() - last.ts) / 1000) : -1;
   const taskLag = rt.pendingSince ? Math.round((Date.now() - rt.pendingSince) / 1000) : -1;
   wxLog(
-    `已推送 条目 ${last.id}（来源=${reason}；文本产生→送达 ${textLag}s` +
+    `已推送 条目 ${last.id}（来源=${reason}${mergeStatus ? "；状态已合并进回复" : ""}；文本产生→送达 ${textLag}s` +
       (taskLag >= 0 ? `；微信下发→送达 ${taskLag}s` : "") +
       `；本窗口第 ${rt?.sentSinceInbound ?? 0} 条主动消息）`,
   );
